@@ -42,6 +42,19 @@ QUERY_BINDS = {
     "dependencies-text.sql": {"b"},
     "view-errors.sql": {"s", "n"},
     "unchecked.sql": {"s"},
+    "rehearsal-settings.sql": set(),
+    "savepoint.sql": set(),
+    "rollback-to-savepoint.sql": set(),
+    "warnings.sql": set(),
+    "table-engine.sql": {"s", "n"},
+    "invalid-views.sql": set(),
+    "views-reading.sql": {"s", "n"},
+    "views-using.sql": {"p"},
+    "views-using-function.sql": {"s", "n"},
+    "table-comment.sql": {"s", "n"},
+    "current-user.sql": set(),
+    "row-set-count.sql": set(),
+    "row-set-sample.sql": set(),
 }
 
 # MySQL's own schemas: never a dependent of the developer's objects

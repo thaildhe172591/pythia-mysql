@@ -11,6 +11,14 @@
    with them. A read session must refuse DDL.
 3. Every object's `ddl` is run into pythia_copy, and the copy must match the
    original in information_schema and in SHOW CREATE TABLE.
+4. The fixture is loaded again, the account may write, and every write path
+   runs through the gate: a procedure created, replaced (checked under a
+   scratch name), refused and restored; a view replaced that breaks the
+   view on top, as predicted (exit 3), and restored; rows that move, rows
+   written, triggers fired; a trigger writing to MyISAM inside a preview
+   (WRITTEN?, exit 3); a dropped column and a rename that break views as
+   predicted, and a prediction that moved after approval; a table comment;
+   a session setting; an account that can do far more.
 
 Never point this at a shared server: it creates an account and drops
 databases. Skipped unless PYTHIA_MYSQL_LIVE_HOST is set:
@@ -134,6 +142,46 @@ class Project:
         code, out, why = self.run(*argv)
         assert code == 0, (argv, why, out)
         return out
+
+    def file(self, name, text):
+        (self.root / name).write_text(text, encoding="utf-8")
+        return name
+
+    def preview(self, name, text):
+        return self.json("apply", self.file(name, text))
+
+    def approve(self, token):
+        """The developer's own act, at their own console."""
+        from pythia_core import human
+        human.FORCE_CONSOLE = True
+        try:
+            code, _, why = self.run("approve", token)
+            assert code == 0, why
+        finally:
+            human.FORCE_CONSOLE = False
+
+    def confirm(self, *argv):
+        """(exit code, the last JSON line or None, the refusal)"""
+        code, out, why = self.run(*argv, "--json")
+        lines = out.strip().splitlines()
+        return code, (json.loads(lines[-1]) if lines and lines[-1].startswith("{")
+                      else None), why
+
+    def write(self, name, text):
+        """Preview, approve, confirm: (exit code, result, refusal)."""
+        doc = self.preview(name, text)
+        self.approve(doc["token"])
+        return self.confirm("apply", name, "--confirm", doc["token"])
+
+    def restore(self, result):
+        eid = result["restore"].split()[-1]
+        doc = self.json("journal", "restore", eid)
+        self.approve(doc["token"])
+        return self.confirm("journal", "restore", eid, "--confirm", doc["token"])
+
+    def policy(self, **groups):
+        (self.root / ".pythia" / "mysql" / "policy.json").write_text(
+            json.dumps(groups), encoding="utf-8")
 
 
 def check_connect(entry):
@@ -322,6 +370,220 @@ def check_ddl_round_trip(entry, agent):
     ok("ddl: columns, routines, parameters, views, triggers and events rebuilt alike")
 
 
+# --- the write path, through the gate ----------------------------------------------------
+
+def scalar(entry, sql):
+    found = rows(entry, sql)
+    return found[0][0] if found else None
+
+
+def body(entry, name):
+    return scalar(entry, "select routine_definition from information_schema.routines "
+                         f"where routine_schema = 'app_owner' and routine_name = '{name}'")
+
+
+def view_ok(entry, schema, name):
+    return scalar(entry, "select table_comment from information_schema.tables where "
+                         f"table_schema = '{schema}' and table_name = '{name}'") == "VIEW"
+
+
+def check_writes(entry):
+    from pythia_core import human
+    human.FORCE_CONSOLE = False             # no person here unless one approves
+    agent = load_fixture(entry)
+    run_script(entry, f"""
+grant select, insert, update, delete, create, alter, drop, index, references, create view,
+      show view, create routine, alter routine, execute, trigger, event on app_owner.* to '{AGENT}'@'%';
+grant select, show view on reporting.* to '{AGENT}'@'%';
+""")
+    p = Project(agent)
+    p.policy(structural="confirm", data_dml="confirm")
+    try:
+        _routines(entry, p)
+        _views(entry, p)
+        _rows(entry, p)
+        _leaks(entry, p)
+        _breakage(entry, p)
+        _comments_and_session(entry, p)
+    finally:
+        human.FORCE_CONSOLE = None
+
+
+P_NEW = """create procedure app_owner.p_new(in p_id bigint unsigned)
+begin
+    select status from app_owner.t_order where id = p_id;
+end"""
+
+
+def _routines(entry, p):
+    doc = p.preview("p_new.sql", P_NEW)
+    assert doc["created"] is True and doc["rehearsal"]["predicted"] is True, doc
+    assert doc["rehearsal"]["verified"] is False, doc
+    assert body(entry, "p_new") is None
+    ok("apply: a new procedure predicted — nothing ran, NOT VERIFIED")
+    code, res, why = p.write("p_new.sql", P_NEW)
+    assert code == 0 and res["restore_is_drop"] is True, (code, why, res)
+    assert "select status" in body(entry, "p_new")
+    ok("approved and confirmed: created once; its undo is a DROP")
+
+    newer = P_NEW.replace("select status", "select status, total")
+    doc = p.preview("p_new.sql", newer)
+    notes = " ".join(doc["rehearsal"]["notes"])
+    assert doc["created"] is False and "no CREATE OR REPLACE PROCEDURE" in notes, doc
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "p_new.sql", "--confirm", doc["token"])
+    assert code == 0, (code, why, res)
+    assert "select status, total" in body(entry, "p_new")
+    assert body(entry, "p_new__pythia_check") is None
+    ok("a CREATE for a procedure that exists replaces it, checked under a scratch name")
+
+    code, _, why = p.write("bad.sql", P_NEW.replace("select status", "selec status"))
+    assert code == 1 and "scratch name" in why and "1064" in why, (code, why)
+    assert "select status, total" in body(entry, "p_new")
+    ok("a replacement MySQL refuses costs nothing: the procedure is untouched")
+
+    code, res2, why = p.restore(res)
+    assert code == 0, (code, why, res2)
+    assert "select status from" in body(entry, "p_new")
+    ok("journal restore: previewed, approved, written — the old body is back")
+
+    doc = p.preview("f_cents.sql", """create function app_owner.f_order_total(p_id bigint unsigned)
+returns decimal(14,2) reads sql data
+return (select total * 100 from app_owner.t_order where id = p_id)""")
+    notes = " ".join(doc["rehearsal"]["notes"])
+    assert f"definer changes from root@% to {AGENT}@%" in notes, notes
+    assert "cannot put the old one back" in notes and "v_total call" in notes, notes
+    ok("replacing another definer's function says what changes, and what cannot be undone")
+
+
+def _views(entry, p):
+    run_script(entry, "create view app_owner.v_summary_top as select status, total "
+                      "from app_owner.v_order_summary;")
+    narrower = ("create or replace view app_owner.v_order_summary as\n"
+                "select status, count(*) as n from app_owner.t_order group by status")
+    doc = p.preview("summary.sql", narrower)
+    assert [b[0] for b in doc["rehearsal"]["broken"]] == ["v_summary_top"], doc["rehearsal"]
+    notes = " ".join(doc["rehearsal"]["notes"])
+    assert f"definer changes from root@% to {AGENT}@%" in notes, notes
+    ok("a view replaced: its SELECT run with LIMIT 0, the view on top predicted invalid")
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "summary.sql", "--confirm", doc["token"])
+    assert code == 3 and [b[0] for b in res["broken"]] == ["v_summary_top"], (code, why, res)
+    assert res["differs"] == [] and not view_ok(entry, "app_owner", "v_summary_top")
+    ok("written as predicted, and broken: exit 3, v_summary_top named")
+    eid = res["restore"].split()[-1]
+    doc = p.json("journal", "restore", eid)
+    p.approve(doc["token"])
+    code, _, why = p.confirm("journal", "restore", eid, "--confirm", doc["token"])
+    assert code == 1 and "SET_ANY_DEFINER" in why and "nothing was written" in why, (code, why)
+    ok("restoring root's view is refused for this account, and nothing was written")
+    # root is a system account: setting it as a definer takes SYSTEM_USER too
+    run_script(entry, f"grant set_any_definer, system_user on *.* to '{AGENT}'@'%';")
+    code, res, why = p.confirm("journal", "restore", eid, "--confirm", doc["token"])
+    run_script(entry, f"revoke set_any_definer, system_user on *.* from '{AGENT}'@'%';")
+    assert code == 0 and view_ok(entry, "app_owner", "v_summary_top"), (code, why, res)
+    assert scalar(entry, "select definer from information_schema.views where "
+                         "table_name = 'v_order_summary'") == "root@%"
+    ok("the approval was unspent: the same command, run again by an account that may, "
+       "restores root's view, and MySQL marks v_summary_top valid again")
+    code, _, why = p.run("apply", p.file("v_bad.sql", "create or replace view app_owner.v_bad "
+                                         "as select nope from app_owner.t_order"))
+    assert code == 1 and "1054" in why and "nothing was written" in why.lower(), why
+    ok("a view MySQL would refuse has nothing to approve")
+
+
+def _rows(entry, p):
+    audit = scalar(entry, "select count(*) from app_owner.t_order_audit")
+    paid = "update app_owner.t_order set total = total + 1 where status = 'DRAFT'"
+    doc = p.preview("paid.sql", paid)
+    assert doc["row_set"]["count"] == 2 and doc["rehearsal"]["rows"] == 2, doc
+    assert doc["rehearsal"]["predicted"] is False, doc
+    assert scalar(entry, "select count(*) from app_owner.t_order_audit") == audit
+    p.approve(doc["token"])
+    run_script(entry, "insert into app_owner.t_order (status, total) values ('DRAFT', 5);")
+    code, _, why = p.confirm("apply", "paid.sql", "--confirm", doc["token"])
+    assert code == 1 and "2 rows" in why and "3" in why, why
+    code, res, why = p.write("paid.sql", paid)
+    assert code == 0 and res["rows"] == 3, (code, why, res)
+    assert scalar(entry, "select count(*) from app_owner.t_order_audit") == audit + 3
+    ok("DML rehearsed and rolled back; rows that moved refused; then written, triggers and all")
+    same = "update app_owner.t_order set status = 'PAID' where status = 'PAID'"
+    code, res, why = p.write("same.sql", same)
+    assert code == 0 and res["rows"] == 1, (code, why, res)
+    ok("an UPDATE that changes no value still counts the row it matched")
+
+
+def _leaks(entry, p):
+    run_script(entry, """
+create table app_owner.t_line_log (id int not null auto_increment primary key, line_id int) engine=MyISAM;
+create trigger app_owner.trg_line_log after update on app_owner.t_order_line for each row
+    insert into app_owner.t_line_log (line_id) values (new.id);
+insert into app_owner.t_order_line (order_id, qty) values (1, 1);
+""")
+    code, out, why = p.run("apply", p.file("qty.sql", "update app_owner.t_order_line set qty = 2 "
+                                           "where order_id = 1"))
+    assert code == 3 and "WRITTEN?" in out and "MyISAM" in out, (code, out, why)
+    assert scalar(entry, "select count(*) from app_owner.t_line_log") == 1
+    assert scalar(entry, "select qty from app_owner.t_order_line where order_id = 1") == 1
+    ok("a trigger writing to MyISAM inside a preview is reported WRITTEN?, exit 3")
+    code, _, why = p.run("apply", p.file("log.sql", "delete from app_owner.t_line_log "
+                                         "where id = 1"))
+    assert code == 1 and "MyISAM table" in why, why
+    ok("a write to a MyISAM table is refused before it runs")
+
+
+def _breakage(entry, p):
+    run_script(entry, "alter table app_owner.t_order add column note2 varchar(10);\n"
+                      "create view app_owner.v_note2 as select id, note2 from app_owner.t_order;")
+    drop = "alter table app_owner.t_order drop column note2"
+    doc = p.preview("drop.sql", drop)
+    assert [b[0] for b in doc["rehearsal"]["broken"]] == ["v_note2"], doc["rehearsal"]
+    assert "column" in doc["destructive"], doc
+    p.approve(doc["token"])
+    run_script(entry, "create view reporting.v_note3 as select note2 from app_owner.t_order;")
+    code, _, why = p.confirm("apply", "drop.sql", "--confirm", doc["token"])
+    assert code == 1 and "reporting.v_note3" in why and "moved" in why, why
+    assert scalar(entry, "select count(*) from information_schema.columns where "
+                         "table_name = 't_order' and column_name = 'note2'") == 1
+    ok("a prediction that moved after approval is refused: nothing ran")
+    code, res, why = p.write("drop.sql", drop)
+    assert code == 3 and {b[0] for b in res["broken"]} == {"v_note2", "reporting.v_note3"}, \
+        (code, why, res)
+    assert res["differs"] == [], res
+    ok("an approved breakage lands as predicted, and exits 3 with what broke")
+    run_script(entry, "create view app_owner.v_unforeseen as select id from app_owner.t_order_audit;")
+    code, res, why = p.write("audit.sql", "rename table app_owner.t_order_audit to "
+                                          "app_owner.t_order_audit_old")
+    assert code == 3 and [b[0] for b in res["broken"]] == ["v_unforeseen"], (code, why, res)
+    assert "trg_order_audit" in res["blind_spot"] and "[text]" in res["blind_spot"], res
+    ok("a rename predicted to break the view that reads it; the trigger naming it, a lead")
+
+
+def _comments_and_session(entry, p):
+    code, res, why = p.write("comment.sql", "alter table app_owner.t_order comment = "
+                                            "'Orders, every one'")
+    assert code == 0, (code, why, res)
+    assert scalar(entry, "select table_comment from information_schema.tables where "
+                         "table_name = 't_order'") == "Orders, every one"
+    code, _, why = p.restore(res)
+    assert code == 0, why
+    assert scalar(entry, "select table_comment from information_schema.tables where "
+                         "table_name = 't_order'") == "Customer orders, 'all' of them"
+    ok("a table comment written, read back and restored")
+    code, out, why = p.run("apply", p.file("session.sql", "set @pythia = 1"))
+    assert code == 0 and "Session setting applied" in out, (why, out)
+    ok("a session setting says it ends with the connection")
+    root = Project(dict(entry, database="app_owner"))
+    root.policy(data_dml="confirm")
+    # t_order's audit trigger writes a table renamed above: the rehearsal says so
+    code, _, why = root.run("apply", root.file("t.sql", "update app_owner.t_order set total = "
+                                               "total where id = 1"))
+    assert code == 1 and "1146" in why and "t_order_audit" in why, why
+    doc = root.preview("root.sql", "delete from app_owner.t_order_audit_old where id = 0")
+    assert "every privilege" in (doc["warning"] or ""), doc
+    ok("an account that can do far more than the change needs is named")
+
+
 def main():
     if not os.environ.get("PYTHIA_MYSQL_LIVE_HOST"):
         print("SKIP live check: PYTHIA_MYSQL_LIVE_HOST is not set")
@@ -337,6 +599,7 @@ def main():
     check_reads(agent)
     check_read_session_refuses_writes(entry)
     check_ddl_round_trip(entry, agent)
+    check_writes(entry)
     print("OK")
 
 

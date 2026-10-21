@@ -268,8 +268,15 @@ def test_connect_passes_exactly_the_settings():
     assert first == {"host": "localhost", "port": 3306, "database": "app_owner",
                      "user": "app_agent", "password": "s3cret", "charset": "utf8mb4",
                      "autocommit": False, "connect_timeout": 10,
+                     # CLIENT_FOUND_ROWS: an UPDATE counts the rows it matched
+                     "client_flag": 2,
                      "program_name": "pythia-mysql"}      # "request": PyMySQL's own default
     assert off["ssl_disabled"] is True and "ssl" not in off
+    # one statement per call, and no client file read by the server, ever:
+    # MySQL refuses the text after a statement when MULTI_STATEMENTS is off
+    for kw in (first, off, require, verify):
+        assert not kw["client_flag"] & (1 << 16) and not kw["client_flag"] & 128, kw
+        assert not kw.get("local_infile"), kw
     # require: encrypted or refused, the certificate not checked
     assert isinstance(require["ssl"], ssl.SSLContext)
     assert require["ssl"].verify_mode == ssl.CERT_NONE and not require["ssl"].check_hostname
@@ -836,6 +843,515 @@ def test_errors_are_verified_only_when_nothing_is_hidden_or_unchecked():
     conn.answers["grants.sql"] = (("Grants",), [("GRANT SELECT ON `app_owner`.* TO `a`@`%`",)])
     rows, blind = read.compile_errors(conn, "app_owner", None)
     assert rows == [] and "SHOW_ROUTINE" in blind
+
+
+# --- the write tier: reading MySQL's SQL, without a database ---------------------------
+
+from pythia_mysql import write  # noqa: E402
+
+
+def test_the_reader_knows_mysql_quoting():
+    text = ("select 'a;b', 'it''s; ok', 'back\\'slash;', \"dq;x\", `semi;colon`, 1--1 # not a cut ;\n"
+            "-- nor this ;\n/* nor ; this */ from t;")
+    lexed = write.lex(text)
+    assert not lexed.unterminated and not lexed.executable
+    assert len(lexed.masked) == len(text)
+    for hidden in ("a;b", "it", "slash", "dq", "semi", "not a cut", "nor this", "nor ; this"):
+        assert hidden not in lexed.masked, hidden
+    assert "1--1" in lexed.masked                  # "--" with no space is arithmetic
+    assert lexed.cuts == [len(text) - 1]
+    assert write.lex("select 'open").unterminated
+    assert write.lex("select `open").unterminated
+    assert write.lex("/* open").unterminated
+    assert write.lex("/*!50000 drop table t */").executable
+
+
+def test_statements_are_cut_as_the_mysql_client_cuts_them():
+    routine = ("create procedure p()\nbegin\n  update t set a = 1;\n  select 1;\nend;")
+    assert write.split_script(routine) == [(1, routine[:-1])]
+    script = ("insert into t values (1);\n\nDELIMITER //\n"
+              "create trigger trg before insert on t for each row\nbegin\n  set new.a = 1;\nend//\n"
+              "DELIMITER ;\nupdate t set a = 2 where id = 1;")
+    got = write.split_script(script)
+    assert [line for line, _ in got] == [1, 4, 9], got
+    assert got[1][1].startswith("create trigger") and got[1][1].endswith("end")
+    assert got[2][1] == "update t set a = 2 where id = 1"
+    assert write.split_script("-- only a comment\n") == []
+
+
+def classified(text):
+    group, why = write.classify(text)
+    assert group, (text, why)
+    return group
+
+
+def refusal(text):
+    group, why = write.classify(text)
+    assert group is None, (text, group)
+    return why
+
+
+def test_classify_sorts_every_statement_or_says_why_not():
+    for text, group in (
+            ("create view v as select 1", "source"),
+            ("CREATE OR REPLACE ALGORITHM=MERGE DEFINER=`root`@`%` SQL SECURITY INVOKER "
+             "VIEW app_owner.v AS SELECT 1", "source"),
+            ("create definer=current_user procedure p() begin select 1; end", "source"),
+            ("create definer='app'@'localhost' function f() returns int deterministic return 1",
+             "source"),
+            ("create trigger trg before insert on t for each row set new.a = 1", "source"),
+            ("create event e on schedule every 1 day do delete from t where id = 0", "source"),
+            ("alter view v as select 2", "source"),
+            ("alter procedure p comment 'x'", "source"),
+            ("alter event e disable", "source"),
+            ("create procedure p()\nbegin\n  if 1 then begin select 1; end; end if;\n"
+             "  select case when 1 then 2 else 3 end into @x;\n  l: loop leave l; end loop;\n"
+             "end;", "source"),
+            ("insert into t values (1)", "data_dml"),
+            ("replace into t values (1)", "data_dml"),
+            ("update t set a = 1 where id = 1", "data_dml"),
+            ("delete from t where id = 1", "data_dml"),
+            ("alter table t_order comment = 'Orders'", "comments"),
+            ("ALTER TABLE `app_owner`.`t_order` COMMENT 'it''s'", "comments"),
+            ("alter table t comment = 'x', add column y int", "structural"),
+            ("create table t (id int primary key)", "structural"),
+            ("alter table t add column x int", "structural"),
+            ("drop table t", "structural"),
+            ("rename table a to b", "structural"),
+            ("truncate table t", "structural"),
+            ("create index ix on t (a)", "structural"),
+            ("drop procedure p", "structural"),
+            ("grant select on app_owner.* to 'u'@'%'", "grants"),
+            ("revoke execute on procedure app_owner.p from 'u'@'%'", "grants"),
+            ("set @x = 1", "session"),
+            ("set names utf8mb4", "session"),
+            ("set session sql_mode = 'STRICT_TRANS_TABLES'", "session")):
+        assert classified(text) == group, (text, group)
+    for text, said in (
+            ("start transaction", "owns the transaction"),
+            ("begin; update t set a = 1 where id = 1; commit;", "owns the transaction"),
+            ("set autocommit = 0", "owns the transaction"),
+            ("lock tables t write", "owns the transaction"),
+            ("declare x int", "stored program"),
+            ("use app_owner", "USE"),
+            ("with x as (select 1) update t set a = 1", "CTE"),
+            ("select * from t", "apply takes writes"),
+            ("show tables", "apply takes writes"),
+            ("(select 1)", "apply takes writes"),
+            ("call p()", "CALL"),
+            ("do sleep(1)", "CALL"),
+            ("prepare s from 'select 1'", "CALL"),
+            ("load data infile '/x' into table t", "LOAD"),
+            ("create temporary table t (id int)", "temporary"),
+            ("create database d", "server"),
+            ("create user 'u'@'%'", "server"),
+            ("set global max_connections = 10", "server"),
+            ("flush privileges", "server"),
+            ("optimize table t", "maintain"),
+            ("create function f returns string soname 'udf.so'", "server"),
+            ("grant all on *.* to 'u'@'%'", "*.*"),
+            ("grant 'r_reader' to 'u'@'%'", "role"),
+            ("create procedure if not exists p() begin end", "IF NOT EXISTS"),
+            ("alter event e rename to e2", "RENAME TO"),
+            ("/*!50000 drop table t */", "executable comment"),
+            ("select 'open", "ends inside a quote"),
+            ("insert into t values (1); insert into t values (2)", "2 statements"),
+            ("create procedure p() begin select 1; end;\ncreate procedure q() begin select 2; end",
+             "Several statements"),
+            ("create procedure p() begin select 1; end; drop table t", "Several statements"),
+            ("create trigger trg before insert on t for each row set new.a = 1; drop table t",
+             "Several statements"),
+            ("create event e on schedule every 1 day do delete from t where id = 0; drop table t",
+             "Several statements"),
+            ("", "no statement"),
+            ("frobnicate", "Cannot classify")):
+        assert said.lower() in refusal(text).lower(), (text, refusal(text))
+
+
+def test_parse_object_reads_the_name_as_mysql_would():
+    got = write.parse_object("CREATE OR REPLACE ALGORITHM=MERGE DEFINER=`root`@`%` SQL "
+                             "SECURITY INVOKER VIEW app_owner.`v_paid` AS SELECT 1", "source")
+    assert {k: got[k] for k in ("type", "name", "schema", "verb", "replace", "definer")} == {
+        "type": "VIEW", "name": "v_paid", "schema": "app_owner", "verb": "create",
+        "replace": True, "definer": "`root`@`%`"}, got
+    got = write.parse_object("create procedure p_paid() begin end", "source")
+    assert (got["type"], got["name"], got["schema"], got["definer"]) == (
+        "PROCEDURE", "p_paid", None, None)
+    stmt = "create procedure p_paid() begin end"
+    assert stmt[slice(*got["span"])] == "p_paid"
+    got = write.parse_object("create trigger app_owner.trg before update on `t_order` for "
+                             "each row set new.a = 1", "source")
+    assert (got["type"], got["name"], got["table"]) == ("TRIGGER", "trg", "t_order")
+    got = write.parse_object("ALTER TABLE `t_order` COMMENT = 'it''s \\'ok\\''", "comments")
+    assert (got["name"], got["value"], got["schema"]) == ("t_order", "it's 'ok'", None)
+    assert write.parse_object("update t set a = 1", "data_dml") is None
+
+
+def test_destruction_is_named():
+    for text, group, said in (
+            ("drop table t", "structural", "DROP"),
+            ("truncate table t", "structural", "TRUNCATE"),
+            ("rename table a to b", "structural", "old name"),
+            ("alter table t drop column a", "structural", "column"),
+            ("alter table t modify a bigint", "structural", "rewrites"),
+            ("replace into t values (1)", "data_dml", "REPLACE"),
+            ("update t set a = 1", "data_dml", "every row"),
+            ("delete from t where 1 = 1", "data_dml", "always true"),
+            ("revoke select on app_owner.* from 'u'@'%'", "grants", "REVOKE"),
+            ("grant select on app_owner.* to 'u'@'%' with grant option", "grants", "pass")):
+        assert said in (write.destructive_reason(text, group) or ""), (text, said)
+    for text, group in (("create view v as select 1", "source"),
+                        ("update t set a = 1 where id = 1", "data_dml"),
+                        ("alter table t add column b int", "structural")):
+        assert write.destructive_reason(text, group) is None, text
+
+
+def test_dml_probe_finds_the_rows_or_refuses_to_guess():
+    assert write.dml_probe("update app_owner.t_order set status = 'PAID' where id = 1;") == \
+        ("app_owner.t_order", "id = 1")
+    assert write.dml_probe("delete from `t_order` where status = 'X' -- trailing") == \
+        ("`t_order`", "status = 'X'")
+    assert write.dml_probe("update t set a = 1") == ("t", None)
+    assert write.dml_probe("insert into t values (1)") is None
+    for text, said in (("update ignore t set a = 1 where id = 1", "IGNORE"),
+                       ("update t set a = 1 where id = 1 limit 1", "LIMIT"),
+                       ("update t join u on u.id = t.id set t.a = 1", "target"),
+                       ("update t, u set t.a = u.a where t.id = u.id", "target"),
+                       ("delete t from t join u on u.id = t.id", "target"),
+                       ("delete from t using t, u where t.id = u.id", "target"),
+                       ("update t set a = 1 where id in (select id from u)", "subquery"),
+                       ("update t set a = 1 where (id = 1", "parentheses"),
+                       ("delete from t where id = 1) or (1 = 1", "parentheses")):
+        expect_exit(lambda: write.dml_probe(text), said)
+
+
+class ScriptCursor(CatalogCursor):
+    """A query file is answered by name; any other text is the statement
+    itself, or a probe built around it, answered by on_text."""
+
+    def __init__(self, conn):
+        super().__init__(conn)
+        self.rowcount = -1
+
+    def execute(self, sql, params=None):
+        if params is not None:
+            return super().execute(sql, params)
+        self.conn.texts.append(sql)
+        cols, rows, count = self.conn.on_text(sql)
+        self.description = [(c,) for c in cols] if cols else None
+        self._rows, self.rowcount = list(rows), count
+
+
+class ScriptConn(CatalogConn):
+    def __init__(self, answers, on_text=None):
+        super().__init__(answers)
+        self.texts = []
+        self.on_text = on_text or (lambda sql: ((), [], 0))
+
+    def cursor(self):
+        return ScriptCursor(self)
+
+
+def test_the_row_set_is_measured_over_every_column():
+    def on_text(sql):
+        if sql.lstrip().startswith("-- Purpose: how many"):
+            return ("n", "fingerprint"), [(3, 123456789)], 1
+        return ("id", "status"), [(i, "DRAFT") for i in range(12)], 12
+    conn = ScriptConn({"columns.sql": (("position", "column_name"), [(1, "id"), (2, "status")])},
+                      on_text)
+    got = write.measure_row_set(conn, "app_owner.t_order", "status = 'DRAFT'")
+    assert (got["count"], got["hash"], got["truncated"], len(got["sample"])) == (3, "123456789",
+                                                                              True, 10)
+    count_sql = conn.texts[0]
+    assert "json_array(`id`, `status`)" in count_sql and "from app_owner.t_order" in count_sql
+    assert "where (status = 'DRAFT')" in count_sql
+    assert conn.asked[0] == ("columns.sql", {"s": "app_owner", "n": "t_order"})
+    conn = ScriptConn({"columns.sql": (("position", "column_name"), []),
+                       "current-schema.sql": (("s",), [("app_owner",)])}, on_text)
+    expect_exit(lambda: write.measure_row_set(conn, "t_gone", None), "no table t_gone")
+
+
+def test_a_snapshot_is_the_rebuilt_definition_or_a_refusal():
+    conn = routine_catalog()
+    ident = write.parse_object("create procedure p_paid() begin end", "source")
+    snap = write.snapshot(conn, "app_owner", "source", ident)
+    assert snap["p_paid"].startswith("CREATE DEFINER=`root`@`%` PROCEDURE `app_owner`.`p_paid`(")
+    assert snap["p_paid"].endswith("\nend")
+    new = write.parse_object("create procedure p_new() begin end", "source")
+    assert write.snapshot(conn, "app_owner", "source", new) == {}
+    hidden = list(P_PAID_ROW)
+    hidden[11] = None
+    conn = routine_catalog({"routine.sql": (ROUTINE_COLS, [tuple(hidden)])})
+    expect_exit(lambda: write.snapshot(conn, "app_owner", "source", ident), "SHOW_ROUTINE")
+    view = CatalogConn({"resolve.sql": resolving(V_PAID),
+                        "view.sql": (VIEW_COLS, [("v_paid", "select 1 AS `1`", "NONE",
+                                                  "DEFINER", "root@%")])})
+    vid = write.parse_object("create or replace view v_paid as select 2", "source")
+    assert write.snapshot(view, "app_owner", "source", vid)["v_paid"].startswith(
+        "CREATE OR REPLACE DEFINER=`root`@`%` VIEW")
+    comments = CatalogConn({"table-comment.sql": (("comment",), [("Orders",)])})
+    cid = write.parse_object("alter table t_order comment = 'All orders'", "comments")
+    assert write.snapshot(comments, "app_owner", "comments", cid) == {"t_order": "Orders"}
+
+
+def test_restore_puts_back_or_drops():
+    cid = write.parse_object("alter table t_order comment = 'All orders'", "comments")
+    assert write.restore_statement("comments", cid, "it's old", {"schema": "app_owner"}) == \
+        "ALTER TABLE `app_owner`.`t_order` COMMENT = 'it''s old'"
+    pid = write.parse_object("create procedure p_new() begin end", "source")
+    assert write.restore_statement("source", pid, "", {"schema": "app_owner"}) == \
+        "DROP PROCEDURE `app_owner`.`p_new`"
+    assert write.restore_statement("source", pid, "CREATE ... old", {"schema": "app_owner"}) == \
+        "CREATE ... old"
+
+
+DML = "update app_owner.t_order set status = 'PAID' where id = 1"
+INNODB = (("engine", "transactional"), [("InnoDB", "YES")])
+
+
+def test_a_data_change_runs_twice_first_in_a_savepoint():
+    conn = ScriptConn({"table-engine.sql": INNODB, "warnings.sql": (("l", "c", "m"), [])},
+                      lambda sql: ((), [], 2))
+    out = write.rehearse(conn, "app_owner", "data_dml", DML, None, {}, DriverError)
+    assert out["error"] is None and out["rows"] == 2 and out["verified"] is True, out
+    assert "predicted" not in out
+    assert conn.names() == ["rehearsal-settings.sql", "table-engine.sql", "savepoint.sql",
+                            "rollback-to-savepoint.sql", "warnings.sql"]
+    assert conn.texts == [DML, DML]
+    assert any("twice" in n for n in out["notes"])
+
+
+def test_a_write_mysql_could_not_roll_back_is_reported_escaped():
+    leak = ("Warning", 1196, "Some non-transactional changed tables couldn't be rolled back")
+    conn = ScriptConn({"table-engine.sql": INNODB, "warnings.sql": (("l", "c", "m"), [leak])},
+                      lambda sql: ((), [], 1))
+    out = write.rehearse(conn, "app_owner", "data_dml", DML, None, {}, DriverError)
+    assert "MyISAM" in out["escaped"] and out["error"].startswith("1196"), out
+    assert conn.texts == [DML]                       # never run a second time
+    myisam = ScriptConn({"table-engine.sql": (("engine", "transactional"), [("MyISAM", "NO")])})
+    out = write.rehearse(myisam, "app_owner", "data_dml", DML, None, {}, DriverError)
+    assert "MyISAM table" in out["error"] and myisam.texts == [], out
+
+    def refuse(sql):
+        raise DriverError(1062, "Duplicate entry '1' for key 'PRIMARY'")
+    failed = ScriptConn({"table-engine.sql": INNODB}, refuse)
+    out = write.rehearse(failed, "app_owner", "data_dml", DML, None, {}, DriverError)
+    assert out["error"] == "1062: Duplicate entry '1' for key 'PRIMARY'"
+    assert failed.names()[-1] == "rollback-to-savepoint.sql"
+
+
+VIEW_SQL = "create or replace view app_owner.v_paid as select id from t_order where status = 'PAID'"
+
+
+def predicting(extra=None, on_text=None):
+    answers = {"invalid-views.sql": (("s", "n", "m"), []), "dependents-text.sql": ((), []),
+               "current-user.sql": (("account",), [("app_agent@%",)])}
+    answers.update(extra or {})
+    return ScriptConn(answers, on_text)
+
+
+def test_a_view_is_predicted_from_its_select_and_the_views_on_top():
+    probe = []
+
+    def on_text(sql):
+        probe.append(sql)
+        return ("id",), [], 0
+    conn = predicting({
+        "columns.sql": (("position", "column_name"), [(1, "id"), (2, "total")]),
+        "views-using.sql": lambda b: (("s", "n"), [("app_owner", "v_paid_big")]
+                                      if "`v_paid`.`total`" in b["p"].replace("!_", "_") else []),
+        "views-reading.sql": lambda b: (("s", "n"), [("reporting", "v_top")]
+                                        if b["n"] == "v_paid_big" else [])}, on_text)
+    ident = write.parse_object(VIEW_SQL, "source")
+    out = write.rehearse(conn, "app_owner", "source", VIEW_SQL, ident,
+                         {"v_paid": "CREATE OR REPLACE ... AS\nselect"}, DriverError)
+    assert out["predicted"] is True and out["error"] is None, out
+    assert probe == ["select * from (select id from t_order where status = 'PAID') as "
+                     "pythia_view_probe limit 0"]
+    assert out["broken"] == [
+        ("reporting.v_top", "VIEW", "would be marked invalid: it reads "
+                                    "app_owner.v_paid_big, which would be invalid"),
+        ("v_paid_big", "VIEW", "would be marked invalid: it reads app_owner.v_paid.total, "
+                               "which this drops")], out["broken"]
+    assert out["prediction"]["broken"] == ["reporting.v_top", "v_paid_big"]
+    assert not any("definer" in n for n in out["notes"])     # "..." names no DEFINER
+    snap = {"v_paid": "CREATE OR REPLACE DEFINER=`root`@`%` VIEW `app_owner`.`v_paid` AS\nx"}
+    out = write.rehearse(conn, "app_owner", "source", VIEW_SQL, ident, snap, DriverError)
+    notes = " ".join(out["notes"])
+    assert "definer changes from root@% to app_agent@%" in notes and "later" in notes, notes
+    plain = VIEW_SQL.replace("create or replace view", "create view")
+    out = write.rehearse(conn, "app_owner", "source", plain, write.parse_object(plain, "source"),
+                         {"v_paid": "..."}, DriverError)
+    assert "CREATE OR REPLACE" in out["error"], out
+
+    def unknown(sql):
+        raise DriverError(1054, "Unknown column 'status' in 'where clause'")
+    out = write.rehearse(predicting(on_text=unknown), "app_owner", "source", VIEW_SQL, ident, {},
+                         DriverError)
+    assert out["error"].startswith("1054: Unknown column") and out["predicted"], out
+
+
+def test_a_routine_is_predicted_not_verified_and_its_replacement_named():
+    stmt = "create procedure app_owner.p_paid(in p_id bigint) begin select p_id; end"
+    ident = write.parse_object(stmt, "source")
+    snap = {"p_paid": "CREATE DEFINER=`root`@`%` PROCEDURE `app_owner`.`p_paid`()\nbegin end"}
+    out = write.rehearse(predicting(), "app_owner", "source", stmt, ident, snap, DriverError)
+    assert out["predicted"] and out["verified"] is False and "only when it runs" in out["blind"]
+    notes = " ".join(out["notes"])
+    assert "no CREATE OR REPLACE PROCEDURE" in notes and "scratch name" in notes
+    assert "definer changes from root@% to app_agent@%" in notes, notes
+    assert "cannot put the old one back" in notes and "SET_ANY_DEFINER" in notes, notes
+    may = predicting({"grants.sql": (("g",), [("GRANT SET_ANY_DEFINER ON *.* TO `a`@`%`",)])})
+    out = write.rehearse(may, "app_owner", "source", stmt, ident, snap, DriverError)
+    assert "cannot put the old one back" not in " ".join(out["notes"])
+    trig = "create trigger trg before insert on t_gone for each row set new.a = 1"
+    out = write.rehearse(predicting({"table-engine.sql": ((), [])}), "app_owner", "source", trig,
+                         write.parse_object(trig, "source"), {}, DriverError)
+    assert "no table t_gone" in out["error"], out
+
+
+def test_ddl_predicts_the_views_it_marks_invalid():
+    conn = predicting({
+        "views-using.sql": lambda b: (("s", "n"), [("app_owner", "v_note")]
+                                      if "`t_order`.`note`" in b["p"].replace("!_", "_") else []),
+        "views-reading.sql": lambda b: (("s", "n"), {
+            "v_note": [("app_owner", "v_note2")],
+            "t_order": [("app_owner", "v_paid")]}.get(b["n"], [])),
+        "views-using-function.sql": (("s", "n"), [("app_owner", "v_total")]),
+        "dependents-text.sql": lambda b: (("s", "n", "t", "d"), [
+            ("app_owner", "p_paid", "PROCEDURE", "update t_order set status = 'PAID'")]
+            if "t!_order" in b["p"] else [])})
+    stmt = "alter table app_owner.t_order drop column note, add column x int"
+    out = write.rehearse(conn, "app_owner", "structural", stmt, None, {}, DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_note", "v_note2"] and out["verified"], out
+    assert "app_owner.t_order.note, which this drops" in out["broken"][0][2]
+    out = write.rehearse(conn, "app_owner", "structural", "drop table t_order restrict", None,
+                         {}, DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_paid"], out
+    assert out["verified"] is False and "p_paid" in out["blind"] and "[text]" in out["blind"]
+    out = write.rehearse(conn, "app_owner", "structural", "rename table t_order to t_orders",
+                         None, {}, DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_paid"], out
+    out = write.rehearse(conn, "app_owner", "structural", "drop function f_total", None, {},
+                         DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_total"], out
+    out = write.rehearse(conn, "app_owner", "structural",
+                         "alter table t_order add column y int, change note note text", None,
+                         {}, DriverError)
+    assert out["broken"] == [] and out["verified"], out
+
+
+def replacing(fail=None):
+    """A catalog holding p_paid, and a server that fails the texts named."""
+    ran = []
+
+    def on_text(sql):
+        ran.append(sql)
+        for needle, error in (fail or {}).items():
+            if needle in sql:
+                raise error
+        return (), [], 0
+    conn = routine_catalog({"rehearsal-settings.sql": ((), [])})
+    conn.__class__ = ScriptConn
+    conn.texts, conn.on_text = [], on_text
+    return conn, ran
+
+
+NEW_P = "create procedure app_owner.p_paid(in p_id bigint) begin select p_id; end"
+
+
+def test_a_routine_is_checked_under_a_scratch_name_then_replaced():
+    ident = write.parse_object(NEW_P, "source")
+    conn, ran = replacing()
+    assert write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError) == {}
+    assert ran == [NEW_P.replace("app_owner.p_paid", "app_owner.`p_paid__pythia_check`"),
+                   "DROP PROCEDURE IF EXISTS `app_owner`.`p_paid__pythia_check`",
+                   "DROP PROCEDURE `app_owner`.`p_paid`", NEW_P], ran
+    conn, ran = replacing({"p_paid__pythia_check`(": DriverError(1064, "You have an error")})
+    out = write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError)
+    assert "1064" in out["error"] and "was not touched" in out["error"] and len(ran) == 1, out
+
+
+def test_a_refused_replacement_puts_the_old_one_back_or_says_it_could_not():
+    ident = write.parse_object(NEW_P, "source")
+    refuse = DriverError(1227, "Access denied; you need the SET_USER_ID privilege")
+    conn, ran = replacing({"select p_id; end": refuse})
+    # the scratch copy holds the same body: let it pass, refuse only the real one
+    conn.on_text = (lambda inner: (lambda sql: inner(sql) if "pythia_check" not in sql
+                                   else (ran.append(sql), ((), [], 0))[1]))(conn.on_text)
+    out = write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError)
+    assert "put back" in out["error"] and ran[-1].startswith("CREATE DEFINER=`root`@`%`"), out
+    conn, ran = replacing({"select p_id; end": refuse, "CREATE DEFINER": refuse})
+    conn.on_text = (lambda inner: (lambda sql: inner(sql) if "pythia_check" not in sql
+                                   else (ran.append(sql), ((), [], 0))[1]))(conn.on_text)
+    out = write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError)
+    assert "does not exist now" in out["escaped"], out
+    lost = DriverError(2013, "Lost connection to MySQL server during query")
+    conn, ran = replacing({"DROP PROCEDURE `app_owner`": lost})
+    out = write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError)
+    assert "no answer" in out["escaped"], out
+
+
+def test_a_trigger_is_dropped_and_created_and_a_new_object_just_created():
+    trg = ("create trigger app_owner.trg_order_audit after update on t_order for each row "
+           "insert into t_order_audit (order_id) values (new.id)")
+    conn = ScriptConn({"resolve.sql": resolving(TRG), "rehearsal-settings.sql": ((), []),
+                       "triggers.sql": (TRIGGER_COLS, [
+                           ("trg_order_audit", "AFTER", "UPDATE", "t_order", 1, "set @x = 1",
+                            "root@%", "")])})
+    out = write.execute(conn, "app_owner", "source", trg, write.parse_object(trg, "source"),
+                        DriverError)
+    assert out == {} and conn.texts == ["DROP TRIGGER `app_owner`.`trg_order_audit`", trg]
+    fresh = ScriptConn({"resolve.sql": resolving(), "rehearsal-settings.sql": ((), [])})
+    out = write.execute(fresh, "app_owner", "structural", "drop table t", None, DriverError)
+    assert out == {} and fresh.texts == ["drop table t"]
+
+
+def test_what_landed_is_read_back_and_compared_with_the_prediction():
+    conn = ScriptConn({"invalid-views.sql": (("s", "n", "m"), [
+        ("app_owner", "v_old", "x"), ("app_owner", "v_note", "1356 v_note"),
+        ("reporting", "v_extra", "1356 v_extra")])})
+    outcome = {"prediction": {"invalid_before": {"app_owner.v_old": "x"},
+                              "broken": ["v_gone", "v_note"]}}
+    got = write.verify_written(conn, "app_owner", "structural", "drop table t", None, outcome,
+                               DriverError)
+    assert [b[0] for b in got["broken"]] == ["reporting.v_extra", "v_note"], got
+    assert got["differs"] == [
+        "reporting.v_extra is marked invalid now; the prediction did not say so",
+        "v_gone was predicted invalid, and MySQL did not mark it"], got
+    view = write.parse_object("create or replace view v_note as select 1", "source")
+    conn.answers.update({"resolve.sql": resolving(("app_owner", "v_note", "VIEW")),
+                         "view.sql": (VIEW_COLS, [("v_note", "select 1", "NONE", "DEFINER",
+                                                   "root@%")])})
+    got = write.verify_written(conn, "app_owner", "source", "create or replace view v_note as "
+                               "select 1", view, {"prediction": {"invalid_before": {},
+                                                                 "broken": []}}, DriverError)
+    assert [o[0] for o in got["own_errors"]] == ["v_note"], got
+    cid = write.parse_object("alter table t_order comment = 'All orders'", "comments")
+    conn = ScriptConn({"invalid-views.sql": ((), []),
+                       "table-comment.sql": (("comment",), [("Orders",)])})
+    got = write.verify_written(conn, "app_owner", "comments", "", cid, {}, DriverError)
+    assert "reads back as 'Orders'" in got["differs"][0], got
+    conn = routine_catalog({"invalid-views.sql": ((), [])})
+    pid = write.parse_object(NEW_P, "source")
+    got = write.verify_written(conn, "app_owner", "source", NEW_P, pid, {}, DriverError)
+    assert "not the one written" in got["differs"][0], got
+
+
+def test_an_account_that_can_do_far_more_is_named():
+    def warn(*lines):
+        return write.privilege_warning(CatalogConn({
+            "grants.sql": (("g",), [(ln,) for ln in lines]),
+            "current-user.sql": (("a",), [("app_agent@%",)])}), "app_owner")
+    assert "every privilege" in warn("GRANT ALL PRIVILEGES ON *.* TO `app_agent`@`%`")
+    assert "any account" in warn("GRANT SYSTEM_USER,SET_USER_ID ON *.* TO `app_agent`@`%`")
+    assert warn("GRANT SELECT, INSERT ON `app_owner`.* TO `app_agent`@`%`") is None
+
+
+def test_the_engine_answers_the_write_and_predict_tiers():
+    assert engine_problems(MySqlEngine(), tiers=("connect", "read", "write", "predict")) == []
+    assert set(MySqlEngine.rollback_notes) == {"source", "comments", "data_dml", "structural",
+                                                "grants", "session"}
 
 
 # --- the release's paperwork ---------------------------------------------------------------------

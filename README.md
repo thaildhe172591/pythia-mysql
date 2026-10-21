@@ -9,12 +9,13 @@ its siblings do on PostgreSQL, SQL Server and MongoDB: the agent learns
 from the live catalog, asks a person before any write, and writes only
 through a gate that snapshots, verifies and reports honestly.
 
-**Pre-alpha (Phase 9a).** It reads everything pythia's Learn movement
-needs, and writes nothing yet.
+**Pre-alpha (Phase 9b).** It reads everything pythia's Learn movement
+needs, and writes through one gate: data rehearsed in a transaction, DDL
+predicted, written once and read back.
 
 | Works today | Next |
 |---|---|
-| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` | the write gate (9b); the harness, deploy, autopilot and lint (9c) |
+| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections`; `apply`, `approve`, `journal`, `policy` | the harness — guard, `install`, `doctor`, the chat doors and skills — with `deploy`, autopilot and lint (9c) |
 
 MySQL 8.4 LTS is the floor: CI runs the whole live check on 8.4, 9.4 and
 9.5, and below 8.4 — or on MariaDB — `check` says so (nothing is refused).
@@ -109,6 +110,97 @@ rest.
   MySQL refuses DML and DDL alike there (error 1792). A read-only account is
   the first line.
 
+### Writing: the gate
+
+```bash
+pythia-mysql apply change.sql                   # preview: nothing written
+pythia-mysql approve 3fa9c1                     # the developer approves, at their own console
+pythia-mysql apply change.sql --confirm 3fa9c1  # writes it — only as approved
+pythia-mysql journal restore <entry>            # undo is a write too: preview, approve, confirm
+pythia-mysql policy                             # which groups may be written, and is rollback real?
+```
+
+Until the harness arrives (9c), the developer approves in their own
+terminal: there is no hook to read a chat answer and no MCP approver yet,
+so the preview names no other door.
+
+### One statement: `apply`
+
+One statement per file. A stored program (`CREATE PROCEDURE`, `FUNCTION`,
+`TRIGGER`, `EVENT`) takes its whole file, its body's `;` included, and
+nothing may follow its body; `DELIMITER` lines are read as the mysql client
+reads them, so `ddl`'s output applies as it is. Anything else ends at its
+`;`. `apply` sorts the statement into a group, and the policy decides:
+`source` (views, procedures, functions, triggers, events) and `comments`
+(`ALTER TABLE ... COMMENT = '...'`, alone) need the developer's approval;
+`data_dml`, `structural` (DDL) and `grants` (`GRANT` and `REVOKE` on a
+schema or an object in it) are denied until the developer runs
+`pythia-mysql policy set <group> confirm` at a console. `session` (`SET`)
+is allowed.
+
+MySQL commits DDL as it runs it, so the write path is split in two:
+
+- **Data is rehearsed.** An INSERT, REPLACE, UPDATE or DELETE runs inside
+  the transaction and is rolled back; the confirm runs it again and commits
+  only if it still matches. An UPDATE or DELETE is approved on its rows:
+  the count, a sample and a fingerprint over every column (an order-free
+  sum of `md5(json_array(...))`); if any row joins, leaves or changes before
+  the confirm, the confirm is refused. An UPDATE counts the rows it
+  matched, as the check does, not only those whose value changed.
+- **A rehearsal cannot write where MySQL cannot roll back.** A statement
+  whose own table is MyISAM, MEMORY or another engine without transactions
+  is refused before it runs. A trigger or function that writes to such a
+  table would turn a preview into a write, so every data change runs first
+  inside a savepoint: when rolling that back draws MySQL's warning 1196,
+  the preview is reported **`WRITTEN?`** with exit 3 — those rows are
+  written — and never as nothing written. The statement therefore runs
+  twice in a rehearsal; the preview says so.
+- **DDL is predicted — nothing runs before the approval.** A view's SELECT
+  runs with `LIMIT 0`, so its names must resolve. The views MySQL would
+  mark invalid are read from information_schema: every view that reads a
+  table, view, function or column the statement drops or renames, and
+  every view on top of those, in any schema. A routine, trigger or event is
+  `NOT VERIFIED` — MySQL checks its names only when it runs — and the
+  routines that name what a statement drops are listed as `[text]` leads.
+  After the approval the statement runs once; the views MySQL marked
+  invalid are read back, and anything unlike the prediction exits 3, as a
+  breakage does. A prediction that moved since the approval refuses the
+  write.
+- **A CREATE for a routine that exists replaces it.** MySQL has no `CREATE
+  OR REPLACE` for a procedure, function, trigger or event. A procedure or
+  function is first created under a scratch name, so that MySQL's verdict
+  on the new text costs nothing; then the old one is dropped and the new
+  one created, and if MySQL refuses it the old one is put back from the
+  snapshot (if that fails too, it is **`WRITTEN?`**, exit 3, with the
+  restore). A trigger or an event is dropped and created; rows written in
+  between fire neither trigger. A view is replaced with `CREATE OR REPLACE
+  VIEW`, which MySQL does in one step.
+- **The definer is said.** A replacement without a `DEFINER` clause is
+  defined by this account; the preview says so when that changes it.
+  Putting back another account's routine or view needs `SET_ANY_DEFINER`
+  (and `SYSTEM_USER` when that account is a system one): when this account
+  lacks it, the preview says the old one could not be put back by it, and a
+  restore it tries is refused with nothing written.
+- **Refused, with the reason:** `CALL`, `DO`, `PREPARE` and `EXECUTE`;
+  compound statements outside a stored program; `SELECT`, `SHOW`, `WITH`;
+  `USE`; transaction control and `LOCK TABLES`; `LOAD DATA`; temporary
+  tables; accounts, roles, databases and other server-level statements
+  (`SET GLOBAL`, `FLUSH`, `GRANT ... ON *.*`); table maintenance
+  (`OPTIMIZE`, `ANALYZE`); `IF NOT EXISTS` on a stored program;
+  executable comments (`/*! ... */`); several statements in one file; an
+  UPDATE or DELETE whose rows cannot be read beforehand (`IGNORE`, `ORDER
+  BY ... LIMIT`, several tables, a join, a subquery, a `PARTITION` clause,
+  parentheses that do not balance); and a routine whose body this account
+  cannot read (nothing to snapshot).
+
+pythia-mysql never turns on `MULTI_STATEMENTS` or `LOCAL INFILE`: MySQL
+itself refuses any text after the one statement sent. A write waits at most
+5 s for a lock (`innodb_lock_wait_timeout`, `lock_wait_timeout`). A
+rehearsal still fires triggers and draws `AUTO_INCREMENT` values, and the
+preview of a data change says so. Exit codes follow pythia: `0` clean, `1`
+refused, `3` written but broken, or written unlike the prediction (with the
+restore command).
+
 ### Least privilege
 
 The read commands need `SELECT` and `SHOW VIEW` on the schemas, and
@@ -125,6 +217,14 @@ with `EVENT` — both also let it change them. Without them, pythia-mysql
 says that triggers and events are hidden; the live check runs every read
 command both ways.
 
+A write needs what the change needs, on its schema only — for example
+`INSERT, UPDATE, DELETE` for data, `CREATE, ALTER, DROP, INDEX, CREATE
+VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT` for DDL. An account
+holding every privilege on the server, `SUPER`, `SYSTEM_USER`,
+`SET_ANY_DEFINER` or `SET_USER_ID` is named in the preview: far more than a
+change needs. The live check runs every write path as an account whose
+write privileges stop at its schema.
+
 ## Tests
 
 ```bash
@@ -133,7 +233,8 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 ```
 
 CI runs the suite on Ubuntu, Windows and macOS, Python 3.9 and 3.13, and
-the live check against MySQL 8.4, 9.4 and 9.5 in service containers. It
+the live check — every read and every write path — against MySQL 8.4, 9.4
+and 9.5 in service containers. It
 tests against the pythia-core branch of the same name when one exists.
 
 ## License

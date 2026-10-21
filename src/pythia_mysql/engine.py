@@ -1,22 +1,27 @@
 """MySQL, through PyMySQL, as a pythia-core engine.
 
-It answers the connect tier (here) and the read tier (read.py). In MySQL a
-schema is a database: a connection's "database" is where unqualified names
-land, and "schema", when it is set, is what pythia reads (check says when
-the two differ).
+It answers the connect tier (here), the read tier (read.py), and the write
+and predict tiers (write.py). In MySQL a schema is a database: a
+connection's "database" is where unqualified names land, and "schema",
+when it is set, is what pythia reads (check says when the two differ).
+MySQL commits DDL as it runs it, so data is rehearsed in a transaction and
+DDL is predicted, written once after the approval, and read back.
 """
 import os
 import re
 import ssl
 import sys
 
-from . import __version__, read
+from . import __version__, read, write
 from .catalog import QUERY_BINDS, QUERY_DIR, fold, ident, q  # noqa: F401 — QUERY_* re-exported
 
 FLOOR = (8, 4)          # MySQL 8.4 LTS: the oldest CI tests
 CONFIG_REL = ".pythia/mysql/connections.json"
 REQUIRED = ("host", "database", "user")
 TLS = ("off", "request", "require", "verify")
+# CLIENT_FOUND_ROWS: an UPDATE reports the rows its WHERE matched, as the
+# row-set check counts them, not only the rows whose value changed
+FOUND_ROWS = 2
 
 
 class MySqlEngine:
@@ -27,6 +32,20 @@ class MySqlEngine:
     version = __version__
     bind_style = "pyformat"
     default_port = 3306
+    rollback_notes = {
+        "source": "Yes — the definition is snapshotted before every write; a new "
+                  "object's undo is a DROP. A routine whose body this account "
+                  "cannot read (no SHOW_ROUTINE) is refused.",
+        "comments": "Yes — the previous table comment is snapshotted.",
+        "data_dml": "No. After commit only a backup, or the binary log replayed "
+                    "to a point in time, brings rows back. Revalidation checks "
+                    "the rows; it is not an undo.",
+        "structural": "No. MySQL commits DDL as it runs it: a dropped column or "
+                      "table is gone. The prediction shows what would break "
+                      "before anything runs.",
+        "grants": "By hand — write the opposite GRANT or REVOKE.",
+        "session": "Not needed — it ends with the connection.",
+    }
 
     # --- the connection's life ------------------------------------------------
 
@@ -59,7 +78,7 @@ class MySqlEngine:
         kw = dict(host=entry["host"], port=int(entry.get("port") or self.default_port),
                   database=entry["database"], user=entry["user"],
                   password=entry.get("password") or "", charset="utf8mb4",
-                  autocommit=False,
+                  autocommit=False, client_flag=FOUND_ROWS,
                   connect_timeout=int(entry.get("connect_timeout") or 10),
                   program_name=self.command)
         if tls == "off":
@@ -194,3 +213,46 @@ class MySqlEngine:
 
     def compile_errors(self, conn, schema, name):
         return read.compile_errors(conn, schema, name)
+
+    # --- the write tier (write.py) -----------------------------------------------
+
+    def classify(self, text):
+        return write.classify(text)
+
+    def prepare_statement(self, text, group):
+        return write.prepare_statement(text, group)
+
+    def parse_object(self, stmt, group):
+        return write.parse_object(stmt, group)
+
+    def destructive_reason(self, stmt, group):
+        return write.destructive_reason(stmt, group)
+
+    def dml_probe(self, stmt):
+        return write.dml_probe(stmt)
+
+    def measure_row_set(self, conn, target, pred):
+        return write.measure_row_set(conn, target, pred)
+
+    def snapshot(self, conn, schema, group, ident):
+        return write.snapshot(conn, schema, group, ident)
+
+    def rehearse(self, conn, schema, group, stmt, ident, snapshot):
+        return write.rehearse(conn, schema, group, stmt, ident, snapshot,
+                              self.driver_errors())
+
+    def restore_statement(self, group, ident, before, outcome):
+        return write.restore_statement(group, ident, before, outcome)
+
+    def privilege_warning(self, conn, schema):
+        return write.privilege_warning(conn, schema)
+
+    # --- the predict tier (write.py): DDL runs once, after the approval -----------
+
+    def execute(self, conn, schema, group, stmt, ident):
+        return write.execute(conn, schema, group, stmt, ident,
+                             self.driver_errors() + (OSError,))
+
+    def verify_written(self, conn, schema, group, stmt, ident, outcome):
+        return write.verify_written(conn, schema, group, stmt, ident, outcome,
+                                    self.driver_errors())
