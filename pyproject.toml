@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pythia-mysql"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "pythia for MySQL: stored-program development for AI agents over pythia-core - catalog queries, impact analysis and an approved write path."
 readme = "README.md"
 license = "MIT"
@@ -16,7 +16,7 @@ requires-python = ">=3.9"
 dependencies = ["pythia-core>=0.1.1,<0.2", "PyMySQL>=1.2"]
 keywords = ["mysql", "stored-procedures", "database", "agent-skills"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -42,4 +42,4 @@ pythia-mysql = "pythia_mysql.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-pythia_mysql = ["queries/*.sql"]
+pythia_mysql = ["queries/*.sql", "skills/*/SKILL.md", "skills/*/reference/*.md"]

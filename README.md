@@ -9,26 +9,87 @@ its siblings do on PostgreSQL, SQL Server and MongoDB: the agent learns
 from the live catalog, asks a person before any write, and writes only
 through a gate that snapshots, verifies and reports honestly.
 
-**Pre-alpha (Phase 9b).** It reads everything pythia's Learn movement
-needs, and writes through one gate: data rehearsed in a transaction, DDL
-predicted, written once and read back.
+**Alpha (0.1.0).** It reads everything pythia's Learn movement needs,
+writes through one gate — data rehearsed in a transaction, DDL predicted,
+written once and read back — and wires a project for an agent: the guard,
+the session brief, the approval doors and the `pythia-mysql-*` skills.
 
-| Works today | Next |
-|---|---|
-| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections`; `apply`, `approve`, `journal`, `policy` | the harness — guard, `install`, `doctor`, the chat doors and skills — with `deploy`, autopilot and lint (9c) |
+| Works today |
+|---|
+| reads: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
+| writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
+| the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
 MySQL 8.4 LTS is the floor: CI runs the whole live check on 8.4, 9.4 and
 9.5, and below 8.4 — or on MariaDB — `check` says so (nothing is refused).
 
-## Install (from git while pre-alpha)
+## Install
+
+```bash
+pip install pythia-mysql
+```
+
+That brings pythia-core, and [PyMySQL](https://pypi.org/project/PyMySQL/),
+pure Python: no client library needs installing, on Windows, macOS or
+Linux. The development version is the main branch of both:
 
 ```bash
 pip install "git+https://github.com/thaildhe172591/pythia-core" \
             "git+https://github.com/thaildhe172591/pythia-mysql"
 ```
 
-That brings [PyMySQL](https://pypi.org/project/PyMySQL/), pure Python: no
-client library needs installing, on Windows, macOS or Linux.
+## Set up a project for an agent
+
+```bash
+cd your-project
+pythia-mysql install     # once; a second run changes nothing
+pythia-mysql doctor      # is everything wired? exit 1 names what is not
+```
+
+`install` writes, and leaves everything else as it was:
+
+- `.pythia/mysql/connections.json`, mode 600, created once from the
+  template — the developer fills in the passwords; an agent never opens it;
+- `.gitignore` lines for that file, this machine's approvals
+  (`.pythia/mysql/grants/`) and `.claude/settings.local.json`;
+- `.claude/settings.local.json`: the hooks (the guard, the session brief,
+  the AskUserQuestion answer), spelled with this interpreter's absolute path
+  so they start whether or not a virtual environment is active, and deny
+  rules for the engine's files;
+- the MCP approver `pythia_mysql` (tool `pythia_mysql_approve`), in this
+  machine's files only: Claude Code's local scope for the project
+  (`~/.claude.json`) and Codex's `~/.codex/config.toml`, each when that
+  client has run here;
+- a `pythia-mysql` block in CLAUDE.md and AGENTS.md (other tools' blocks,
+  and the developer's own text, are left alone);
+- the skills, in `.claude/skills` and `.agents/skills`:
+  `using-pythia-mysql` (the router), `pythia-mysql-explore`,
+  `pythia-mysql-impact`, `pythia-mysql-apply`, `pythia-mysql-deploy`,
+  `pythia-mysql-autopilot`, `pythia-mysql-verify`.
+
+Restart the agent's session after installing, so the hooks load. Each
+session then starts with the rules and a `STATE` line (connections, the
+write policy). Before every tool call the guard decides:
+
+| The agent runs | The guard |
+|---|---|
+| `mysql`, `mysqlsh` or `mariadb` given write SQL (DDL, DML, `CALL`, `DO`, `PREPARE`/`EXECUTE`, `LOAD DATA`, `SET GLOBAL`, `SELECT ... INTO OUTFILE`, `LOCK TABLES`, `source file.sql`), a script (`< file`, a pipe into the client, `mysqlsh -f`), MySQL Shell's `util.load*`; `mysqlimport`; `mysqladmin` create, drop, flush, kill, password or shutdown — also behind `docker exec`, `ssh`, `sudo` or `bash -c` | denies: writes go through `pythia-mysql apply` |
+| an MCP SQL tool given write SQL | denies |
+| reading `connections.json`; editing `policy.json`, the journal or a grant; setting `PYTHIA_MYSQL_CI`; calling `grants.mint` from a one-liner | denies |
+| a `pythia-mysql` read, a preview, `approve --card` | allows without a prompt |
+| `apply --confirm <token>` the developer already approved on this connection | allows; apply re-verifies it |
+| `mysql` reads, `mysqldump`, `approve`, `--yes`, `policy set`, anything compound | stays out: the client asks |
+
+The guard reads a command for what it names, not what it means: it can
+deny a harmless command (a `SELECT` whose text mentions `drop`) and miss a
+write spelled in a way it does not list. It sees the commands Claude Code
+hands its tools, not Workbench or a driver inside the application. The gate
+behind it holds either way (pythia-core's SECURITY.md).
+
+pythia-postgres, pythia-mssql and pythia-mongo install beside it in one
+project, and pythia for Oracle too: each keeps the others' hooks and
+instruction blocks, and each guard and approval hook acts for its own tool
+only (pythia-core's CI checks it with all five installed).
 
 ## Connections
 
@@ -114,15 +175,106 @@ rest.
 
 ```bash
 pythia-mysql apply change.sql                   # preview: nothing written
-pythia-mysql approve 3fa9c1                     # the developer approves, at their own console
+pythia-mysql approve 3fa9c1                     # the developer approves (or from chat, below)
 pythia-mysql apply change.sql --confirm 3fa9c1  # writes it — only as approved
 pythia-mysql journal restore <entry>            # undo is a write too: preview, approve, confirm
 pythia-mysql policy                             # which groups may be written, and is rollback real?
 ```
 
-Until the harness arrives (9c), the developer approves in their own
-terminal: there is no hook to read a chat answer and no MCP approver yet,
-so the preview names no other door.
+The developer approves through the first door that works:
+
+1. **In Claude Code's chat.** The agent asks with AskUserQuestion, its text
+   exactly the output of `pythia-mysql approve --card <token>`, options
+   Approve / Reject. The answer hook records the approval only when the
+   question carried that card and the developer chose Approve themselves —
+   not an answer the agent wrote, not a dialog that closed unattended.
+2. **Through the MCP approver** (`pythia_mysql_approve`; Codex starts
+   here): the client shows the card, and only an explicit Approve counts.
+3. **At the developer's console:** `pythia-mysql approve <token>`.
+
+`pythia-mysql doctor` warns about settings that would answer the chat door
+for the developer (`dontAsk` mode, an allow rule for AskUserQuestion, a hook
+matching every tool).
+
+### A release: `deploy`, one transaction
+
+```bash
+pythia-mysql deploy 01_fix.sql 02_backfill.sql                     # preview the release as one transaction
+pythia-mysql deploy 01_fix.sql 02_backfill.sql --confirm 9c41e0b2aa  # all of it, as approved, or none
+```
+
+A release is data: one or more scripts of `INSERT`, `REPLACE`, `UPDATE` and
+`DELETE`, cut at each `;` (and at `DELIMITER` lines, as the mysql client
+cuts them). It is rehearsed in one transaction: each statement in order,
+its rows taken at its own point, then everything rolls back. One card shows
+every statement, and one approval (a 10-digit token, through the same
+doors) covers the release; a single statement's token cannot be approved
+alone. The confirm checks that every statement is byte-identical to what
+was approved before anything runs, re-runs the release in one transaction,
+and commits only if every statement still matches. A statement that fails,
+or rows that moved, roll back the whole release.
+
+MySQL commits DDL as it runs it, so a release cannot hold it: a table, a
+column, an index, a view, a routine, a trigger, an event, a comment or a
+grant is refused, with nothing written — apply each on its own, before or
+after the data. A `SET` inside a release is refused too, and anything
+`apply` refuses. Rows the release itself inserts get a new `AUTO_INCREMENT`
+value, `CURRENT_TIMESTAMP` or `UUID()` every time it runs, so an UPDATE or
+DELETE of them later in the same release never matches its approval: give
+them their final values in the INSERT.
+
+### Lint: before any apply
+
+```bash
+pythia-mysql lint 01_table.sql 02_view.sql   # a change's files in one run
+pythia-mysql lint --rules                    # every rule and its effective severity
+```
+
+The rules read what MySQL accepts and a reviewer would not:
+
+| Rule | Default | Why |
+|---|---|---|
+| `mysql-non-transactional` | error | a MyISAM, MEMORY or other table without transactions cannot be rehearsed, can lose rows in a crash, and ignores foreign keys |
+| `mysql-utf8mb3` | warn | `utf8` is `utf8mb3`: no emoji and no rarer CJK — `utf8mb4` |
+| `mysql-select-star` | warn | MySQL expands `*` when a view is created and keeps that list; a procedure's result changes shape; `EXISTS (SELECT * ...)` is fine |
+| `mysql-not-in-subquery` | warn | `NOT IN (SELECT ...)` is never true when the subquery returns a NULL |
+| `mysql-primary-key` | warn | without one, InnoDB invents a hidden key that replication and row-based tools cannot use |
+| `mysql-table-comment` | warn | a new table gets its `COMMENT` in the same change (an `ALTER TABLE ... COMMENT` in the same run counts) |
+| `mysql-function-characteristic` | warn | a function declaring none of `DETERMINISTIC`, `NO SQL`, `READS SQL DATA` is refused while binary logging is on (1418) |
+| `mysql-definer` | warn | a `DEFINER` naming an account needs `SET_ANY_DEFINER`, and breaks where that account does not exist |
+| `mysql-zero-date` | warn | `'0000-00-00'` is refused under MySQL's default `NO_ZERO_DATE` |
+| `mysql-limit-order` | info | `LIMIT` without `ORDER BY` in stored code takes whichever rows come first |
+
+What MySQL rejects itself is left to the rehearsal or the prediction. The
+team sets severities and naming patterns in `.pythia/mysql/lint.json`:
+
+```json
+{"severity": {"mysql-select-star": "error", "naming": "error"},
+ "naming": {"PROCEDURE": "^p_[a-z0-9_]+$", "VIEW": "^v_[a-z0-9_]+$"}}
+```
+
+Every preview shows the findings, a statement's errors are on its card, and
+autopilot never lands a lint error.
+
+### Autopilot: one lease instead of every approval
+
+```bash
+pythia-mysql autopilot request --groups source,comments --hours 2 --max-writes 30
+pythia-mysql autopilot report      # every write under the lease, with its restore
+pythia-mysql autopilot off         # anyone may revoke
+```
+
+When the developer wants the agent to work without approving each write,
+the agent requests a lease. Its card names the connection, the groups, the
+time, the number of writes and whether destructive statements are included,
+and nothing is delegated until the developer approves it through a door (or
+runs `pythia-mysql autopilot on` at a console). While it lasts, `apply` and
+`deploy` land what it covers without `--confirm` — still snapshotted,
+rehearsed or predicted, read back and journaled. It never covers another
+connection, one marked `"protected": true` (or an `"env"` of prod /
+production / prd / live), a group or destructive statement the card did not
+name, or more than 1000 rows; a write that breaks something, lands unlike
+its prediction or is `WRITTEN?`, or five failures in a row pause it.
 
 ### One statement: `apply`
 
@@ -235,9 +387,10 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 ```
 
 CI runs the suite on Ubuntu, Windows and macOS, Python 3.9 and 3.13, and
-the live check — every read and every write path — against MySQL 8.4, 9.4
-and 9.5 in service containers. It
-tests against the pythia-core branch of the same name when one exists.
+the live check — every read, every write path, a release, a lint finding in
+a real preview and a write under a lease — against MySQL 8.4, 9.4 and 9.5
+in service containers. It tests against the pythia-core branch of the same
+name when one exists.
 
 ## License
 

@@ -18,7 +18,9 @@
    written, triggers fired; a trigger writing to MyISAM inside a preview
    (WRITTEN?, exit 3); a dropped column and a rename that break views as
    predicted, and a prediction that moved after approval; a table comment;
-   a session setting; an account that can do far more.
+   a session setting; an account that can do far more. Then a data release
+   through `deploy` (and DDL in one refused), a lint error in a real
+   preview, and a write under an autopilot lease.
 
 Never point this at a shared server: it creates an account and drops
 databases. Skipped unless PYTHIA_MYSQL_LIVE_HOST is set:
@@ -372,6 +374,13 @@ def check_ddl_round_trip(entry, agent):
 
 # --- the write path, through the gate ----------------------------------------------------
 
+RELEASE = """-- a data release: three statements, one transaction
+insert into app_owner.t_order (status, total) values ('DRAFT', 7);
+update app_owner.t_order set total = total + 100 where id = 1;
+
+delete from app_owner.t_order_line where order_id = 1 and qty = 99;
+"""
+
 def scalar(entry, sql):
     found = rows(entry, sql)
     return found[0][0] if found else None
@@ -405,6 +414,9 @@ grant select, show view on reporting.* to '{AGENT}'@'%';
         _leaks(entry, p)
         _breakage(entry, p)
         _comments_and_session(entry, p)
+        _release(entry, p)
+        _lint(entry, p)
+        _lease(entry, p)
     finally:
         human.FORCE_CONSOLE = None
 
@@ -588,6 +600,93 @@ def _comments_and_session(entry, p):
     doc = root.preview("root.sql", "delete from app_owner.t_order_audit_old where id = 0")
     assert "every privilege" in (doc["warning"] or ""), doc
     ok("an account that can do far more than the change needs is named")
+
+
+def _release(entry, p):
+    """deploy: data rehearsed as one transaction, landed as one, or not at all."""
+    count = "select count(*) from app_owner.t_order where total = 7"
+    total = "select total from app_owner.t_order where id = 1"
+    # the audit trigger's table, renamed above, comes back
+    run_script(entry, "rename table app_owner.t_order_audit_old to app_owner.t_order_audit;")
+    before, was = scalar(entry, count), scalar(entry, total)
+    p.file("rel.sql", RELEASE)
+    code, doc, why = p.confirm("deploy", "rel.sql")
+    assert code == 0, (why, doc)
+    assert [(m["line"], m["group"]) for m in doc["members"]] == [
+        (2, "data_dml"), (3, "data_dml"), (5, "data_dml")], doc["members"]
+    assert [m["rehearsal"]["rows"] for m in doc["members"]] == [1, 1, 0], doc["members"]
+    assert scalar(entry, count) == before and scalar(entry, total) == was
+    ok("deploy previews a data release as one transaction, and writes nothing")
+
+    code, _, why = p.run("approve", "--card", doc["members"][1]["token"])
+    assert code == 1 and "approved as a whole" in why, why
+    p.approve(doc["batch"])
+    run_script(entry, "update app_owner.t_order set total = total + 1 where id = 1;")
+    code, _, why = p.confirm("deploy", "rel.sql", "--confirm", doc["batch"])
+    assert code == 1 and "statement 2" in why and "nothing was written" in why.lower(), why
+    assert scalar(entry, count) == before          # statement 1 did not land either
+    ok("a release whose rows moved after approval rolls back whole")
+
+    code, doc, why = p.confirm("deploy", "rel.sql")
+    p.approve(doc["batch"])
+    was = scalar(entry, total)
+    code, res, why = p.confirm("deploy", "rel.sql", "--confirm", doc["batch"])
+    assert code == 0 and res["applied"], (why, res)
+    assert scalar(entry, count) == before + 1 and scalar(entry, total) == was + 100
+    ok("an approved release lands whole, in one commit")
+
+    p.file("ddl.sql", "insert into app_owner.t_order (status, total) values ('DRAFT', 8);\n"
+                      "alter table app_owner.t_order add column in_release int;\n")
+    code, _, why = p.run("deploy", "ddl.sql")
+    assert code == 1 and "ddl.sql:2" in why and "apply it on its own" in why.lower(), why
+    assert scalar(entry, "select count(*) from app_owner.t_order where total = 8") == 0
+    assert scalar(entry, "select count(*) from information_schema.columns where "
+                         "table_name = 't_order' and column_name = 'in_release'") == 0
+    ok("DDL in a release is refused, and nothing before it lands")
+
+
+def _lint(entry, p):
+    code, doc, why = p.confirm("apply", p.file("log.sql", (
+        "create table app_owner.t_audit_log (\n    id int not null,\n    at datetime\n"
+        ") engine=MyISAM")))
+    assert code == 0, why
+    found = [(f["rule"], f["line"], f["severity"]) for f in doc["lint"]]
+    assert ("mysql-non-transactional", 4, "error") in found, found
+    assert ("mysql-primary-key", 1, "warn") in found, found
+    code, _, why = p.run("lint", "log.sql")
+    assert code == 1, why
+    ok("lint: a MyISAM table is an error in a real preview, and lint exits 1")
+
+
+def _lease(entry, p):
+    """autopilot: one approved lease lands covered writes, and nothing else."""
+    from pythia_core import human
+    code, doc, why = p.confirm("autopilot", "request", "--groups", "comments",
+                               "--max-writes", "2")
+    assert code == 0 and len(doc["token"]) == 8, why
+    text = "alter table app_owner.t_order comment = 'orders, under a lease'"
+    code, doc2, _ = p.confirm("apply", p.file("c1.sql", text))
+    assert code == 0 and doc2["will_apply"] is False         # a request is no lease
+    human.FORCE_CONSOLE = True
+    try:
+        code, _, why = p.run("approve", doc["token"])
+        assert code == 0, why
+    finally:
+        human.FORCE_CONSOLE = False
+    code, res, why = p.confirm("apply", "c1.sql")
+    assert code == 0 and res["applied"] and res["confirmed_via"] == "autopilot", (why, res)
+    assert scalar(entry, "select table_comment from information_schema.tables where "
+                         "table_name = 't_order'") == "orders, under a lease"
+    code, doc3, why = p.confirm("apply", p.file("s1.sql", "alter table app_owner.t_order "
+                                                          "add column under_lease int"))
+    assert code == 0 and doc3["will_apply"] is False, why
+    assert "does not cover structural" in doc3["autopilot"]["why"], doc3["autopilot"]
+    assert scalar(entry, "select count(*) from information_schema.columns where "
+                         "table_name = 't_order' and column_name = 'under_lease'") == 0
+    code, report, _ = p.confirm("autopilot", "report")
+    assert [w["verdict"] for w in report["writes"]] == ["ok"], report
+    assert p.run("autopilot", "off")[0] == 0
+    ok("autopilot: an approved lease lands a covered write — a predicted one — and only that")
 
 
 def main():

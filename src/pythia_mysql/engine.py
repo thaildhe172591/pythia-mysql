@@ -1,18 +1,20 @@
 """MySQL, through PyMySQL, as a pythia-core engine.
 
-It answers the connect tier (here), the read tier (read.py), and the write
-and predict tiers (write.py). In MySQL a schema is a database: a
+It answers the connect tier (here), the read tier (read.py), the write,
+predict and release tiers (write.py), the lint tier (rules.py) and the
+harness tier (guard.py). In MySQL a schema is a database: a
 connection's "database" is where unqualified names land, and "schema",
 when it is set, is what pythia reads (check says when the two differ).
 MySQL commits DDL as it runs it, so data is rehearsed in a transaction and
 DDL is predicted, written once after the approval, and read back.
 """
+import copy
 import os
 import re
 import ssl
 import sys
 
-from . import __version__, read, write
+from . import __version__, guard, read, write
 from .catalog import QUERY_BINDS, QUERY_DIR, fold, ident, q  # noqa: F401 — QUERY_* re-exported
 
 FLOOR = (8, 4)          # MySQL 8.4 LTS: the oldest CI tests
@@ -256,3 +258,31 @@ class MySqlEngine:
     def verify_written(self, conn, schema, group, stmt, ident, outcome):
         return write.verify_written(conn, schema, group, stmt, ident, outcome,
                                     self.driver_errors())
+
+    # --- the release tier (write.py): a release is data, in one transaction ------
+
+    def split_script(self, text):
+        return write.split_script(text)
+
+    # --- the lint tier (rules.py) ------------------------------------------------
+
+    def lint_rules(self):
+        from . import rules
+        return list(rules.RULES)
+
+    # --- the harness tier (guard.py) ---------------------------------------------
+
+    def raw_client_pattern(self):
+        return guard.CLIENTS
+
+    def write_sql_pattern(self):
+        return guard.WRITE_SQL
+
+    def script_pattern(self):
+        return guard.SCRIPT
+
+    def connections_template(self):
+        return copy.deepcopy(guard.TEMPLATE)
+
+    def skills_dir(self):
+        return guard.SKILLS_DIR

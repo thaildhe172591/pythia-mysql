@@ -1354,6 +1354,237 @@ def test_the_engine_answers_the_write_and_predict_tiers():
                                                 "grants", "session"}
 
 
+# --- Phase 9c: the harness, release and lint tiers, and the skill pack ------------------
+
+from pythia_core import harness, skills as skill_contract  # noqa: E402
+
+SKILL_NAMES = ("using-pythia-mysql", "pythia-mysql-apply", "pythia-mysql-autopilot",
+               "pythia-mysql-deploy", "pythia-mysql-explore", "pythia-mysql-impact",
+               "pythia-mysql-verify")
+
+
+@contextlib.contextmanager
+def scratch_project():
+    keep = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("PYTHIA_")}
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td).resolve()
+        cfg = root / ".pythia" / "mysql" / "connections.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps({"dev": {"host": "localhost", "database": "app_owner",
+                                           "user": "u"}}), encoding="utf-8")
+        try:
+            yield root
+        finally:
+            os.environ.update(keep)
+
+
+def guard(root, command, tool="Bash"):
+    tin = {"command": command} if tool == "Bash" else {"sql": command}
+    out = harness.pre_tool_decision(MySqlEngine(), {
+        "tool_name": tool, "tool_input": tin, "cwd": str(root)})
+    return out and out["hookSpecificOutput"]["permissionDecision"]
+
+
+def test_the_engine_answers_the_harness_release_and_lint_tiers():
+    assert engine_problems(MySqlEngine(), tiers=(
+        "connect", "read", "write", "predict", "harness", "release", "lint")) == []
+    assert MySqlEngine().split_script("update t set x = 1 where id = 1;\n\n"
+                                      "delete from t where id = 2;") == [
+        (1, "update t set x = 1 where id = 1"), (3, "delete from t where id = 2")]
+
+
+def test_the_guard_denies_the_mysql_client_writing_around_the_gate():
+    with scratch_project() as root:
+        for cmd in ('mysql -h db -u app -p app_owner -e "drop table t_order"',
+                    'mysql -e "CREATE PROCEDURE p() BEGIN SELECT 1; END"',
+                    'MYSQL_PWD=x mysql -h localhost -u root -e "update t_order set status = 1"',
+                    'mysql app_owner -e "update low_priority t_order set status = 1 where id = 1"',
+                    'mysql app_owner -e "delete from t_order where id = 1"',
+                    'mysql app_owner -e "insert into t_order values (1)"',
+                    'mysql app_owner -e "replace into t_order values (1)"',
+                    'mysql app_owner -e "truncate table t_order"',
+                    'mysql app_owner -e "rename table t_order to t_orders"',
+                    'mysql app_owner -e "call p_order_paid(1)"',
+                    'mysql app_owner -e "do f_purge()"',
+                    "mysql app_owner -e \"prepare s from 'drop table t'; execute s\"",
+                    "mysql app_owner -e \"select * from t_order into outfile '/tmp/o.csv'\"",
+                    "mysql app_owner -e \"load data infile '/tmp/o.csv' into table t_order\"",
+                    'mysql app_owner -e "grant select on app_owner.* to u"',
+                    'mysql app_owner -e "set global read_only = 0"',
+                    'mysql -e "flush privileges"', 'mysql -e "kill 52"',
+                    'mysql -e "install plugin x soname \'x.so\'"',
+                    'mysql app_owner -e "lock tables t_order write"',
+                    'mysql app_owner -e "source release.sql"',
+                    "mysql app_owner < release.sql", "cat release.sql | mysql app_owner",
+                    "gunzip -c dump.sql.gz | mysql app_owner",
+                    "mysqlimport --local app_owner t_order.csv",
+                    "mysqladmin -u root drop app_owner", "mysqladmin shutdown",
+                    "mysqlsh --sql -f release.sql", "mysqlsh --file=release.sql",
+                    "mysqlsh -e \"util.loadDump('/backups/app')\"",
+                    "mariadb app_owner -e 'drop view v_order'",
+                    "/usr/bin/mysql -e 'alter table t_order add note int'",
+                    'docker exec db mysql -e "drop table t_order"',
+                    "bash -c 'mysql app_owner < fix.sql'"):
+            assert guard(root, cmd) == "deny", cmd
+
+
+def test_the_guard_leaves_mysql_reads_to_the_client():
+    with scratch_project() as root:
+        for cmd in ('mysql -h db -e "select count(*) from t_order"',
+                    "mysql app_owner -e \"select replace(note, 'a', 'b') from t_order\"",
+                    'mysql app_owner --execute="show create table t_order"',
+                    'for t in a b; do mysql -e "select 1"; done',
+                    'source ~/.profile && mysql -e "select 1"',
+                    "mysql --version", "mysqldump --no-data app_owner > schema.sql",
+                    'mysql -e "select updated_at, created_by, is_deleted from t_order"'):
+            assert guard(root, cmd) is None, cmd
+        assert guard(root, 'pythia-mysql ls "t_order%"') == "allow"
+        assert guard(root, "DROP TABLE t_order", tool="mcp__mysql__query") == "deny"
+        assert guard(root, "CALL p_settle()", tool="mcp__mysql__execute_sql") == "deny"
+        assert guard(root, "select 1", tool="mcp__mysql__query") is None
+
+
+def test_install_scaffolds_the_example_config():
+    example = json.loads((ROOT / "examples" / "connections.example.json")
+                         .read_text(encoding="utf-8"))
+    assert MySqlEngine().connections_template() == example
+
+
+def test_the_skill_pack_holds_the_contract_and_routes_every_skill():
+    pack = skill_contract.pack(MySqlEngine().skills_dir())
+    assert tuple(sorted(p.name for p in pack)) == tuple(sorted(SKILL_NAMES))
+    for skill in pack:
+        assert skill_contract.lint(skill / "SKILL.md") == [], skill.name
+    router = (MySqlEngine().skills_dir() / "using-pythia-mysql" / "SKILL.md") \
+        .read_text(encoding="utf-8")
+    for name in SKILL_NAMES[1:]:
+        assert f"`{name}`" in router, f"the router never routes to {name}"
+    for named in set(re.findall(r"`(pythia-mysql-[a-z-]+)`", router)):
+        assert named in SKILL_NAMES, f"the router names a skill that is not shipped: {named}"
+    text = "\n".join((s / "SKILL.md").read_text(encoding="utf-8") for s in pack)
+    assert "pythia-mysql approve <token>" in text and "--confirm <token>" in text
+    assert "WRITTEN?" in text and "predicted — nothing ran" in text
+    apply_skill = (MySqlEngine().skills_dir() / "pythia-mysql-apply" / "SKILL.md") \
+        .read_text(encoding="utf-8")
+    doors = [apply_skill.index(d) for d in (
+        "AskUserQuestion", "pythia_mysql_approve", "pythia-mysql approve <token>")]
+    assert doors == sorted(doors), "the apply skill names the doors out of order"
+    assert "pythia-mysql approve --card <token>" in apply_skill
+    refusals = (MySqlEngine().skills_dir() / "pythia-mysql-apply" / "reference" /
+                "refusals.md").read_text(encoding="utf-8")
+    for said in ("MyISAM", "IF NOT EXISTS", "/*!", "deploy"):
+        assert said in refusals, said
+
+
+def test_the_skills_ship_in_the_wheel():
+    toml = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    for glob in ('"skills/*/SKILL.md"', '"skills/*/reference/*.md"'):
+        assert glob in toml, f"package-data misses {glob}"
+
+
+def test_the_mcp_approver_answers_as_a_real_process():
+    import subprocess
+    core_src = pathlib.Path(sys.modules["pythia_core"].__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), str(core_src)])}
+    session = "".join(json.dumps(m) + "\n" for m in (
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "pythia_mysql_approve", "arguments": {"token": "abc123"}}}))
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run([sys.executable, "-m", "pythia_mysql", "mcp"],
+                           input=session, capture_output=True, text=True, cwd=td,
+                           env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = [json.loads(line) for line in r.stdout.splitlines()]
+    assert out[0]["result"]["serverInfo"]["name"] == "pythia_mysql"
+    assert [t["name"] for t in out[1]["result"]["tools"]] == ["pythia_mysql_approve"]
+    assert out[2]["result"]["isError"]                    # no such preview: nothing minted
+    assert "no pending preview" in out[2]["result"]["content"][0]["text"].lower()
+
+
+def lint_ids(*statements):
+    """{(rule, statement index, line)} over a change of statements."""
+    from pythia_core import lint
+    stmts = [{"file": "f.sql", "line": 1, "text": t, "group": write.classify(t)[0],
+              "n": i + 1} for i, t in enumerate(statements)]
+    found = lint.run(MySqlEngine(), {"severity": {}, "naming": {}}, stmts)
+    return {(f["rule"], f["n"], f["line"]) for f in found}, found
+
+
+def rules_of(*statements):
+    return {r for r, _, _ in lint_ids(*statements)[0]}
+
+
+def test_lint_refuses_a_table_mysql_cannot_roll_back():
+    ids, found = lint_ids("create table app_owner.t_log (\n  id int primary key\n) "
+                          "engine=MyISAM comment='log'")
+    assert ("mysql-non-transactional", 1, 3) in ids, ids
+    assert next(f for f in found if f["rule"] == "mysql-non-transactional")["severity"] == "error"
+    assert "mysql-non-transactional" in rules_of("alter table t_log engine = memory")
+    assert "mysql-non-transactional" not in rules_of(
+        "create table t (id int primary key) engine=InnoDB comment='x'")
+
+
+def test_lint_reads_charsets_star_selects_and_not_in():
+    ids, _ = lint_ids("create view app_owner.v_order as\nselect * from app_owner.t_order",
+                      "create table t_note (id int primary key, body text character set "
+                      "utf8) comment='notes'",
+                      "delete from t_order where id not in (select order_id from t_paid)",
+                      "create view v_ok as select id from t where exists (select * from u)")
+    assert {("mysql-select-star", 1, 2), ("mysql-utf8mb3", 2, 1),
+            ("mysql-not-in-subquery", 3, 1)} <= ids, ids
+    assert ("mysql-select-star", 4, 1) not in ids
+    assert "mysql-utf8mb3" not in rules_of("create table t (id int primary key) "
+                                           "charset=utf8mb4 comment='x'")
+
+
+def test_lint_asks_for_a_primary_key_and_a_comment_on_every_new_table():
+    bare = "create table app_owner.t_note (\n  id int,\n  body text\n)"
+    ids, _ = lint_ids(bare)
+    assert {("mysql-primary-key", 1, 1), ("mysql-table-comment", 1, 1)} <= ids, ids
+    assert not rules_of("create table t_note (id int primary key) comment='Notes'") & {
+        "mysql-primary-key", "mysql-table-comment"}
+    # a COMMENT in another statement of the same change counts
+    assert "mysql-table-comment" not in rules_of(
+        "create table t_note (id int primary key)",
+        "alter table t_note comment = 'Notes on an order'")
+    assert "mysql-table-comment" in rules_of(
+        "create table t_note (id int primary key, body text comment 'a column')")
+    assert not rules_of("create table t_copy like t_note")
+
+
+def test_lint_reads_how_functions_declare_what_they_do():
+    bad = "create function f_total(p_id int) returns int\nbegin\n  return 1;\nend"
+    assert ("mysql-function-characteristic", 1, 1) in lint_ids(bad)[0]
+    for good in ("create function f(p int) returns int deterministic return p",
+                 "create function f(p int) returns int reads sql data return p",
+                 "create function f(p int) returns int not deterministic no sql return p"):
+        assert "mysql-function-characteristic" not in rules_of(good), good
+    assert "mysql-function-characteristic" in rules_of(
+        "create function f(p int) returns int not deterministic return p")
+
+
+def test_lint_reads_definers_zero_dates_and_limits():
+    ids, found = lint_ids(
+        "create definer=`root`@`%` procedure p()\nbegin\n  select id from t limit 1;\nend",
+        "create table t (id int primary key, at date default '0000-00-00') comment='x'",
+        "create definer = current_user view v as select id from t order by id limit 5")
+    assert {("mysql-definer", 1, 1), ("mysql-limit-order", 1, 3),
+            ("mysql-zero-date", 2, 1)} <= ids, ids
+    assert not {r for r, n, _ in ids if n == 3} & {"mysql-definer", "mysql-limit-order"}
+    assert next(f for f in found if f["rule"] == "mysql-limit-order")["severity"] == "info"
+
+
+def test_the_release_workflow_checks_the_tag_against_the_version():
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert 'tags: ["v*"]' in text and "environment: pypi" in text
+    assert "id-token: write" in text and "skip-existing: true" in text
+    for needle in ('version = \\"$V\\"', 'src/pythia_mysql/__init__.py', "## $V "):
+        assert needle in text, needle
+
+
 # --- the release's paperwork ---------------------------------------------------------------------
 
 def test_the_version_has_its_changelog_entry():

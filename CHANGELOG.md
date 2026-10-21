@@ -1,6 +1,38 @@
 # Changelog
 
-## 0.1.0.dev0 — unreleased
+## 0.1.0 — unreleased
+
+The first release: Alpha. It needs pythia-core 0.1.1.
+
+### Phase 9c: the harness, the release, lint and the skills
+
+- **The harness tier.** `install` wires a project (the connections
+  template, `.gitignore`, the hooks and deny rules, the MCP approver
+  `pythia_mysql`, the CLAUDE.md and AGENTS.md blocks, the skills); `doctor`
+  checks it. The guard denies the `mysql`, `mysqlsh` and `mariadb` clients
+  given write SQL or a script, `mysqlimport`, and `mysqladmin`'s writing
+  subcommands — also behind `docker exec`, `ssh`, `sudo` or `bash -c` —
+  and an MCP SQL tool given write SQL. The approval doors are the chat card,
+  the MCP approver and the terminal.
+- **`deploy`, a release of data in one transaction** under one approval.
+  Scripts are cut at `;` and at `DELIMITER` lines; DDL in a release is
+  refused with nothing written, since MySQL commits it as it runs it. Rows
+  the release itself inserts cannot be updated or deleted later in the same
+  release: their `AUTO_INCREMENT`, `CURRENT_TIMESTAMP` or `UUID()` values
+  differ every run, and the README and the deploy skill say so.
+- **Ten lint rules:** `mysql-non-transactional` (error), `mysql-utf8mb3`,
+  `mysql-select-star`, `mysql-not-in-subquery`, `mysql-primary-key`,
+  `mysql-table-comment`, `mysql-function-characteristic`, `mysql-definer`,
+  `mysql-zero-date` (warn) and `mysql-limit-order` (info).
+- **Autopilot** over pythia-core's leases: a predicted write under a lease
+  lands, is read back, and pauses the lease when it lands unlike its
+  prediction.
+- **Seven skills:** `using-pythia-mysql`, `pythia-mysql-explore`,
+  `pythia-mysql-impact`, `pythia-mysql-apply`, `pythia-mysql-deploy`,
+  `pythia-mysql-autopilot`, `pythia-mysql-verify`.
+- **The live check** adds a release, a lint finding in a real preview and a
+  write under a lease, on MySQL 8.4, 9.4 and 9.5; the `release` workflow
+  publishes on a version tag.
 
 ### Phase 9b: the write and predict tiers
 

@@ -9,27 +9,90 @@ Oracle và các engine anh em làm trên PostgreSQL, SQL Server và MongoDB:
 agent học từ catalog đang chạy, hỏi một người trước mọi lần ghi, và chỉ ghi
 qua một cổng có snapshot, có kiểm chứng và báo cáo trung thực.
 
-**Pre-alpha (Phase 9b).** Nó đọc được mọi thứ mà nhịp Học của pythia cần,
-và ghi qua một cổng duy nhất: dữ liệu được diễn tập trong transaction, DDL
-được dự đoán, ghi một lần rồi đọc lại.
+**Alpha (0.1.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
+một cổng duy nhất — dữ liệu được diễn tập trong transaction, DDL được dự
+đoán, ghi một lần rồi đọc lại — và chuẩn bị một project cho agent: guard,
+bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-mysql-*`.
 
-| Đã dùng được | Tiếp theo |
-|---|---|
-| `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections`; `apply`, `approve`, `journal`, `policy` | harness — guard, `install`, `doctor`, các cánh cửa duyệt trong chat và skill — cùng `deploy`, autopilot và lint (9c) |
+| Đã dùng được |
+|---|
+| đọc: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
+| ghi: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
+| harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
 MySQL 8.4 LTS là phiên bản tối thiểu: CI chạy toàn bộ live check trên 8.4,
 9.4 và 9.5, và thấp hơn 8.4 — hoặc trên MariaDB — thì `check` nói rõ (không
 gì bị từ chối).
 
-## Cài đặt (từ git khi còn pre-alpha)
+## Cài đặt
+
+```bash
+pip install pythia-mysql
+```
+
+Lệnh này kéo theo pythia-core, và [PyMySQL](https://pypi.org/project/PyMySQL/),
+viết thuần Python: không cần cài thư viện client nào, trên Windows, macOS
+hay Linux. Bản đang phát triển là nhánh main của cả hai:
 
 ```bash
 pip install "git+https://github.com/thaildhe172591/pythia-core" \
             "git+https://github.com/thaildhe172591/pythia-mysql"
 ```
 
-Lệnh này kéo theo [PyMySQL](https://pypi.org/project/PyMySQL/), viết thuần
-Python: không cần cài thư viện client nào, trên Windows, macOS hay Linux.
+## Chuẩn bị một project cho agent
+
+```bash
+cd your-project
+pythia-mysql install     # once; a second run changes nothing
+pythia-mysql doctor      # is everything wired? exit 1 names what is not
+```
+
+`install` ghi những thứ sau, và giữ nguyên mọi thứ khác:
+
+- `.pythia/mysql/connections.json`, mode 600, tạo một lần từ template — dev
+  tự điền mật khẩu; agent không bao giờ mở file này;
+- các dòng `.gitignore` cho file đó, cho các lần duyệt của máy này
+  (`.pythia/mysql/grants/`) và cho `.claude/settings.local.json`;
+- `.claude/settings.local.json`: các hook (guard, bản tóm tắt đầu phiên,
+  câu trả lời AskUserQuestion), ghi bằng đường dẫn tuyệt đối của interpreter
+  này để chúng chạy được dù virtual environment có được kích hoạt hay không,
+  và các deny rule cho file của engine;
+- MCP approver `pythia_mysql` (tool `pythia_mysql_approve`), chỉ trong file
+  riêng của máy này: local scope của Claude Code cho project
+  (`~/.claude.json`) và `~/.codex/config.toml` của Codex, mỗi cái khi client
+  đó đã từng chạy ở đây;
+- một khối `pythia-mysql` trong CLAUDE.md và AGENTS.md (khối của các công cụ
+  khác, và chữ của chính dev, được giữ nguyên);
+- các skill, trong `.claude/skills` và `.agents/skills`:
+  `using-pythia-mysql` (bộ định tuyến), `pythia-mysql-explore`,
+  `pythia-mysql-impact`, `pythia-mysql-apply`, `pythia-mysql-deploy`,
+  `pythia-mysql-autopilot`, `pythia-mysql-verify`.
+
+Sau khi cài, khởi động lại phiên của agent để hook được nạp. Từ đó mỗi phiên
+bắt đầu bằng các luật và một dòng `STATE` (connection, write policy). Trước
+mỗi lần gọi tool, guard quyết định:
+
+| Agent chạy | Guard |
+|---|---|
+| `mysql`, `mysqlsh` hay `mariadb` được đưa SQL ghi (DDL, DML, `CALL`, `DO`, `PREPARE`/`EXECUTE`, `LOAD DATA`, `SET GLOBAL`, `SELECT ... INTO OUTFILE`, `LOCK TABLES`, `source file.sql`), một script (`< file`, một pipe vào client, `mysqlsh -f`), `util.load*` của MySQL Shell; `mysqlimport`; `mysqladmin` create, drop, flush, kill, password hay shutdown — kể cả sau `docker exec`, `ssh`, `sudo` hay `bash -c` | chặn: mọi lần ghi đi qua `pythia-mysql apply` |
+| một MCP SQL tool được đưa SQL ghi | chặn |
+| đọc `connections.json`; sửa `policy.json`, journal hay một grant; đặt `PYTHIA_MYSQL_CI`; gọi `grants.mint` từ một one-liner | chặn |
+| một lệnh đọc của `pythia-mysql`, một preview, `approve --card` | cho qua, không hỏi |
+| `apply --confirm <token>` mà dev đã duyệt trên connection này | cho qua; apply kiểm lại |
+| `mysql` chỉ đọc, `mysqldump`, `approve`, `--yes`, `policy set`, mọi lệnh ghép | đứng ngoài: client tự hỏi |
+
+Guard đọc một lệnh theo những gì nó gọi tên, không theo ý nghĩa của nó: nó
+có thể chặn một lệnh vô hại (một `SELECT` có chữ `drop` trong nội dung) và
+bỏ lọt một lần ghi được viết theo cách nó không liệt kê. Nó thấy các lệnh mà
+Claude Code đưa cho các tool, không thấy Workbench hay một driver bên trong
+ứng dụng. Cổng phía sau vẫn giữ được trong cả hai trường hợp (SECURITY.md
+của pythia-core).
+
+pythia-postgres, pythia-mssql và pythia-mongo cài cạnh nó trong cùng một
+project, và pythia cho Oracle cũng vậy: mỗi bên giữ nguyên hook và khối
+hướng dẫn của các bên khác, và guard cùng hook duyệt của mỗi bên chỉ hành
+động cho chính công cụ của nó (CI của pythia-core kiểm tra điều này khi cả
+năm cùng được cài).
 
 ## Kết nối
 
@@ -114,15 +177,107 @@ phần còn lại.
 
 ```bash
 pythia-mysql apply change.sql                   # preview: nothing written
-pythia-mysql approve 3fa9c1                     # the developer approves, at their own console
+pythia-mysql approve 3fa9c1                     # the developer approves (or from chat, below)
 pythia-mysql apply change.sql --confirm 3fa9c1  # writes it — only as approved
 pythia-mysql journal restore <entry>            # undo is a write too: preview, approve, confirm
 pythia-mysql policy                             # which groups may be written, and is rollback real?
 ```
 
-Cho tới khi có harness (9c), developer duyệt ngay trong terminal của chính
-họ: chưa có hook nào đọc câu trả lời trong chat và chưa có MCP approver, nên
-preview không nêu cánh cửa nào khác.
+Dev duyệt qua cánh cửa đầu tiên dùng được:
+
+1. **Trong chat của Claude Code.** Agent hỏi bằng AskUserQuestion, nội dung
+   đúng nguyên văn output của `pythia-mysql approve --card <token>`, hai lựa
+   chọn Approve / Reject. Hook nhận câu trả lời chỉ ghi nhận lần duyệt khi
+   câu hỏi mang đúng thẻ đó và chính dev chọn Approve — không phải câu trả
+   lời do agent viết, không phải một hộp thoại tự đóng khi không có ai.
+2. **Qua MCP approver** (`pythia_mysql_approve`; Codex bắt đầu từ đây):
+   client hiện thẻ, và chỉ một lần Approve rõ ràng mới được tính.
+3. **Ở console của dev:** `pythia-mysql approve <token>`.
+
+`pythia-mysql doctor` cảnh báo những thiết lập có thể tự trả lời cánh cửa
+chat thay cho dev (chế độ `dontAsk`, một allow rule cho AskUserQuestion, một
+hook khớp mọi tool).
+
+### Một release: `deploy`, một transaction
+
+```bash
+pythia-mysql deploy 01_fix.sql 02_backfill.sql                     # preview the release as one transaction
+pythia-mysql deploy 01_fix.sql 02_backfill.sql --confirm 9c41e0b2aa  # all of it, as approved, or none
+```
+
+Một release là dữ liệu: một hay nhiều script gồm `INSERT`, `REPLACE`,
+`UPDATE` và `DELETE`, được cắt ở mỗi `;` (và ở các dòng `DELIMITER`, như
+mysql client cắt). Nó được rehearse trong một transaction: từng câu lệnh
+theo thứ tự, số dòng lấy tại đúng thời điểm của nó, rồi tất cả được
+rollback. Một thẻ hiện mọi câu lệnh, và một lần duyệt (token 10 chữ số, qua
+cùng các cánh cửa) phủ cả release; token của một câu lệnh lẻ không được
+duyệt riêng. Lúc confirm, nó kiểm từng câu lệnh giống hệt từng byte với bản
+đã duyệt trước khi chạy gì, chạy lại release trong một transaction, và chỉ
+commit nếu mọi câu lệnh vẫn khớp. Một câu lệnh lỗi, hoặc các dòng đã thay
+đổi, sẽ rollback cả release.
+
+MySQL commit DDL ngay khi chạy nó, nên một release không thể chứa DDL: một
+table, một cột, một index, một view, một routine, một trigger, một event,
+một comment hay một grant đều bị từ chối, không có gì được ghi — hãy apply
+từng cái riêng, trước hoặc sau phần dữ liệu. Một `SET` trong release cũng bị
+từ chối, cùng mọi thứ `apply` từ chối. Các dòng do chính release insert
+nhận một giá trị `AUTO_INCREMENT`, `CURRENT_TIMESTAMP` hay `UUID()` mới mỗi
+lần chạy, nên một UPDATE hay DELETE nhắm vào chúng ở sau trong cùng release
+không bao giờ khớp với lần duyệt: hãy cho chúng giá trị cuối cùng ngay
+trong INSERT.
+
+### Lint: trước mọi lần apply
+
+```bash
+pythia-mysql lint 01_table.sql 02_view.sql   # a change's files in one run
+pythia-mysql lint --rules                    # every rule and its effective severity
+```
+
+Các rule đọc những gì MySQL chấp nhận mà một người review thì không:
+
+| Rule | Mặc định | Vì sao |
+|---|---|---|
+| `mysql-non-transactional` | error | một table MyISAM, MEMORY hay engine khác không có transaction thì không rehearse được, có thể mất dòng khi crash, và bỏ qua foreign key |
+| `mysql-utf8mb3` | warn | `utf8` là `utf8mb3`: không có emoji và các ký tự CJK hiếm — dùng `utf8mb4` |
+| `mysql-select-star` | warn | MySQL khai triển `*` khi tạo view và giữ nguyên danh sách đó; kết quả của một procedure đổi hình dạng; `EXISTS (SELECT * ...)` thì không sao |
+| `mysql-not-in-subquery` | warn | `NOT IN (SELECT ...)` không bao giờ đúng khi subquery trả về một NULL |
+| `mysql-primary-key` | warn | thiếu nó, InnoDB tự tạo một khóa ẩn mà replication và các công cụ theo dòng không dùng được |
+| `mysql-table-comment` | warn | một table mới có `COMMENT` của nó trong cùng thay đổi (một `ALTER TABLE ... COMMENT` trong cùng lần chạy cũng được tính) |
+| `mysql-function-characteristic` | warn | một function không khai báo `DETERMINISTIC`, `NO SQL` hay `READS SQL DATA` bị từ chối khi binary logging đang bật (1418) |
+| `mysql-definer` | warn | một `DEFINER` nêu tên một tài khoản cần `SET_ANY_DEFINER`, và hỏng ở nơi tài khoản đó không tồn tại |
+| `mysql-zero-date` | warn | `'0000-00-00'` bị từ chối dưới `NO_ZERO_DATE` mặc định của MySQL |
+| `mysql-limit-order` | info | `LIMIT` không có `ORDER BY` trong stored code lấy những dòng nào tới trước |
+
+Những gì MySQL tự từ chối được để cho rehearsal hoặc dự đoán. Team đặt
+severity và quy ước đặt tên trong `.pythia/mysql/lint.json`:
+
+```json
+{"severity": {"mysql-select-star": "error", "naming": "error"},
+ "naming": {"PROCEDURE": "^p_[a-z0-9_]+$", "VIEW": "^v_[a-z0-9_]+$"}}
+```
+
+Mọi preview đều hiện các phát hiện, lỗi của một câu lệnh nằm trên thẻ của
+nó, và autopilot không bao giờ ghi một thay đổi còn lỗi lint.
+
+### Autopilot: một lease thay cho từng lần duyệt
+
+```bash
+pythia-mysql autopilot request --groups source,comments --hours 2 --max-writes 30
+pythia-mysql autopilot report      # every write under the lease, with its restore
+pythia-mysql autopilot off         # anyone may revoke
+```
+
+Khi dev muốn agent làm việc mà không phải duyệt từng lần ghi, agent xin một
+lease. Thẻ của nó nêu connection, các group, thời gian, số lần ghi và có gồm
+câu lệnh phá hủy hay không, và chưa có gì được ủy quyền cho tới khi dev duyệt
+nó qua một cánh cửa (hoặc tự chạy `pythia-mysql autopilot on` ở console).
+Trong thời gian lease còn hiệu lực, `apply` và `deploy` ghi những gì nó phủ
+mà không cần `--confirm` — vẫn có snapshot, rehearse hoặc dự đoán, đọc lại
+và ghi journal. Lease không bao giờ phủ một connection khác, một connection
+đánh dấu `"protected": true` (hoặc có `"env"` là prod / production / prd /
+live), một group hay câu lệnh phá hủy mà thẻ không nêu, hoặc quá 1000 dòng;
+một lần ghi làm gãy thứ gì đó, ghi ra khác với dự đoán hoặc là `WRITTEN?`,
+hoặc năm lần thất bại liên tiếp, sẽ tạm dừng nó.
 
 ### Một câu lệnh: `apply`
 
@@ -235,9 +390,9 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 ```
 
 CI chạy bộ test trên Ubuntu, Windows và macOS, Python 3.9 và 3.13, và live
-check — mọi đường đọc và mọi đường ghi — với MySQL 8.4, 9.4 và 9.5 trong các
-service container. Nó test với
-nhánh pythia-core cùng tên khi có.
+check — mọi đường đọc, mọi đường ghi, một release, một phát hiện lint trong
+một preview thật và một lần ghi dưới lease — với MySQL 8.4, 9.4 và 9.5 trong
+các service container. Nó test với nhánh pythia-core cùng tên khi có.
 
 ## Giấy phép
 
