@@ -522,10 +522,16 @@ insert into app_owner.t_order_line (order_id, qty) values (1, 1);
 """)
     code, out, why = p.run("apply", p.file("qty.sql", "update app_owner.t_order_line set qty = 2 "
                                            "where order_id = 1"))
-    assert code == 3 and "WRITTEN?" in out and "MyISAM" in out, (code, out, why)
-    assert scalar(entry, "select count(*) from app_owner.t_line_log") == 1
     assert scalar(entry, "select qty from app_owner.t_order_line where order_id = 1") == 1
-    ok("a trigger writing to MyISAM inside a preview is reported WRITTEN?, exit 3")
+    if scalar(entry, "select @@enforce_gtid_consistency") in ("ON", 1, "1"):
+        # MySQL refuses a statement writing both kinds of table itself (1785)
+        assert code == 1 and "1785" in why and "nothing was written" in why.lower(), (code, why)
+        assert scalar(entry, "select count(*) from app_owner.t_line_log") == 0
+        ok("a trigger writing to MyISAM: MySQL, enforcing GTID consistency, refuses it whole")
+    else:
+        assert code == 3 and "WRITTEN?" in out and "MyISAM" in out, (code, out, why)
+        assert scalar(entry, "select count(*) from app_owner.t_line_log") == 1
+        ok("a trigger writing to MyISAM inside a preview is reported WRITTEN?, exit 3")
     code, _, why = p.run("apply", p.file("log.sql", "delete from app_owner.t_line_log "
                                          "where id = 1"))
     assert code == 1 and "MyISAM table" in why, why

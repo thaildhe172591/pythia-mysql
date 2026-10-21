@@ -154,7 +154,9 @@ MySQL commit DDL ngay khi chạy, nên đường ghi tách làm hai:
   chạy trước trong một savepoint: khi rollback savepoint đó khiến MySQL báo
   cảnh báo 1196, preview được báo là **`WRITTEN?`** với exit 3 — các dòng
   đó đã được ghi — và không bao giờ là chưa ghi gì. Vì thế câu lệnh chạy hai
-  lần trong một bản diễn tập; preview có nói rõ.
+  lần trong một bản diễn tập; preview có nói rõ. Một server bật kiểm tra
+  GTID consistency tự từ chối câu lệnh như vậy (lỗi 1785), trước khi ghi bất
+  cứ gì.
 - **DDL được dự đoán — không gì chạy trước khi được duyệt.** SELECT của một
   view chạy với `LIMIT 0`, nên các tên trong đó phải phân giải được. Các
   view mà MySQL sẽ đánh dấu không hợp lệ được đọc từ information_schema: mọi

@@ -154,7 +154,9 @@ MySQL commits DDL as it runs it, so the write path is split in two:
   inside a savepoint: when rolling that back draws MySQL's warning 1196,
   the preview is reported **`WRITTEN?`** with exit 3 — those rows are
   written — and never as nothing written. The statement therefore runs
-  twice in a rehearsal; the preview says so.
+  twice in a rehearsal; the preview says so. A server that enforces GTID
+  consistency refuses such a statement itself (error 1785), before
+  anything is written.
 - **DDL is predicted — nothing runs before the approval.** A view's SELECT
   runs with `LIMIT 0`, so its names must resolve. The views MySQL would
   mark invalid are read from information_schema: every view that reads a
