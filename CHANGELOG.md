@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-10-21
 
 The first release: Alpha. It needs pythia-core 0.1.1.
 
