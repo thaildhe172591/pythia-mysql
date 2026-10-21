@@ -1,7 +1,8 @@
 -- Purpose: a table's options, for the CREATE TABLE `ddl` rebuilds, and
 --          whether it is partitioned (a clause the rebuild leaves out)
 -- Binds:   %(s)s schema, %(n)s table name
--- Returns: ENGINE, CHARSET, COLLATION, OPTIONS, COMMENT, PARTITIONED
+-- Returns: ENGINE, CHARSET, COLLATION, OPTIONS, COMMENT, PARTITIONED, VERSIONED
+--          (always 0: MySQL has no system-versioned tables)
 select t.engine             as engine,
        c.character_set_name as charset,
        t.table_collation    as collation,
@@ -11,7 +12,8 @@ select t.engine             as engine,
                  from information_schema.partitions p
                 where p.table_schema = t.table_schema
                   and p.table_name = t.table_name
-                  and p.partition_name is not null) as partitioned
+                  and p.partition_name is not null) as partitioned,
+       0                    as versioned
   from information_schema.tables t
   left join information_schema.collations c on c.collation_name = t.table_collation
  where t.table_schema = %(s)s

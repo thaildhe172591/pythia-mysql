@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pythia-mysql against a real MySQL — a disposable one only.
+"""pythia-mysql against a real MySQL or MariaDB — a disposable one only.
 
 1. Always (when PYTHIA_MYSQL_LIVE_HOST is set): connect and `check`.
 2. With PYTHIA_MYSQL_LIVE_DISPOSABLE=1 only: the databases app_owner,
@@ -21,6 +21,11 @@
    a session setting; an account that can do far more. Then a data release
    through `deploy` (and DDL in one refused), a lint error in a real
    preview, and a write under an autopilot lease.
+
+On MariaDB (Phase 11a) the reads run on tests/fixtures/app_owner_mariadb.sql
+— a sequence, a package and a column-level check besides — with the
+privilege MariaDB shows routines behind (SHOW CREATE ROUTINE from 11.3,
+SELECT on mysql.proc before), and every write must be refused.
 
 Never point this at a shared server: it creates an account and drops
 databases. Skipped unless PYTHIA_MYSQL_LIVE_HOST is set:
@@ -48,6 +53,7 @@ for candidate in (os.environ.get("PYTHIA_CORE_SRC"), ROOT.parent / "pythia-core"
 
 AGENT = "pythia_agent"
 COPY = "pythia_copy"
+MARIADB = None          # (major, minor) of the MariaDB under test; None on MySQL
 
 
 def ok(what):
@@ -186,24 +192,36 @@ class Project:
             json.dumps(groups), encoding="utf-8")
 
 
+def which_server(entry):
+    global MARIADB
+    version = rows(entry, "select version()")[0][0]
+    m = re.match(r"(\d+)\.(\d+)", version)
+    MARIADB = (int(m.group(1)), int(m.group(2))) if "mariadb" in version.lower() else None
+
+
 def check_connect(entry):
     p = Project(dict(entry, database="mysql"))
     doc = p.json("check")
     server = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}["server"]
-    assert server.startswith("MySQL ") and "database mysql" in server, server
-    assert doc["below_floor"] is None, doc["below_floor"]    # CI runs 8.4 and up
+    name = "MariaDB" if MARIADB else "MySQL"
+    assert server.startswith(name + " ") and "database mysql" in server, server
+    assert doc["below_floor"] is None, doc["below_floor"]    # CI runs 8.4 and 10.11 up
     ok(f"check: {server}, at or above the floor")
 
 
 def load_fixture(entry):
-    run_script(entry, (ROOT / "tests" / "fixtures" / "app_owner.sql").read_text(encoding="utf-8"))
+    fixture = "app_owner_mariadb.sql" if MARIADB else "app_owner.sql"
+    run_script(entry, (ROOT / "tests" / "fixtures" / fixture).read_text(encoding="utf-8"))
     password = "Agent#" + secrets.token_hex(8)
+    # what lets an account read routines it did not define
+    routines = ("show_routine on *.*" if not MARIADB else
+                "show create routine on *.*" if MARIADB >= (11, 3) else "select on mysql.proc")
     run_script(entry, f"""
 drop user if exists '{AGENT}'@'%';
 create user '{AGENT}'@'%' identified by '{password}';
 grant select, show view on app_owner.* to '{AGENT}'@'%';
 grant select, show view on reporting.* to '{AGENT}'@'%';
-grant show_routine on *.* to '{AGENT}'@'%';
+grant {routines} to '{AGENT}'@'%';
 """)
     return {"host": entry["host"], "port": entry["port"], "database": "app_owner",
             "user": AGENT, "password": password}
@@ -239,7 +257,11 @@ def check_reads(agent):
     assert {("trg_order_audit", "TRIGGER"), ("ev_purge_audit", "EVENT"),
             ("p_order_paid", "PROCEDURE"), ("f_order_total", "FUNCTION"),
             ("v_total", "VIEW")} <= names, names
-    ok("ls: tables, views, routines, triggers and events by LIKE pattern")
+    if MARIADB:
+        assert {("s_order", "SEQUENCE"), ("pkg_order", "PACKAGE"),
+                ("pkg_order", "PACKAGE BODY")} <= names, names
+    ok("ls: tables, views, routines, triggers and events by LIKE pattern"
+       + (", and MariaDB's sequences and packages" if MARIADB else ""))
 
     rows_ = p.json("src", "f_order_total")["rows"]
     assert rows_[0]["LINE"] == 1 and rows_[0]["TEXT"].startswith(
@@ -252,22 +274,26 @@ def check_reads(agent):
     ok("grep: in any case, numbered as src numbers")
 
     cols = [(r["COLUMN_NAME"], r["DATA_TYPE"]) for r in p.json("cols", "t_order")["rows"]]
-    assert cols[:3] == [("id", "bigint unsigned"), ("status", "varchar(10)"),
-                        ("total", "decimal(12,2)")], cols
-    ok("cols: a table's columns as MySQL types them")
+    assert cols[:3] == [("id", "bigint(20) unsigned" if MARIADB else "bigint unsigned"),
+                        ("status", "varchar(10)"), ("total", "decimal(12,2)")], cols
+    ok("cols: a table's columns as the server types them")
 
+    # MariaDB records no view usage: its views are read in their definitions
+    view_how = "definition" if MARIADB else "catalog"
     doc = p.json("impact", "t_order")
     found = tree(doc)
     for row in [(1, "app_owner", "t_order_line", "TABLE", "catalog"),
                 (1, "app_owner", "trg_order_audit", "TRIGGER", "catalog"),
-                (1, "app_owner", "v_order_summary", "VIEW", "catalog"),
-                (1, "app_owner", "v_total", "VIEW", "catalog"),
-                (1, "reporting", "v_paid", "VIEW", "catalog"),
+                (1, "app_owner", "v_order_summary", "VIEW", view_how),
+                (1, "app_owner", "v_total", "VIEW", view_how),
+                (1, "reporting", "v_paid", "VIEW", view_how),
                 (1, "app_owner", "f_order_total", "FUNCTION", "text"),
                 (1, "app_owner", "p_order_count", "PROCEDURE", "text"),
                 (1, "app_owner", "p_order_paid", "PROCEDURE", "text")]:
         assert row in found, (row, found)
-    assert (2, "app_owner", "v_total", "VIEW", "catalog") in found, found
+    assert (2, "app_owner", "v_total", "VIEW", view_how) in found, found
+    if MARIADB:
+        assert (1, "app_owner", "pkg_order", "PACKAGE BODY", "text") in found, found
     assert doc["summary"]["other_schemas"] == ["reporting.v_paid"], doc["summary"]
     assert doc["summary"]["needs_review"] is True
     assert not any("privilege on app_owner" in b for b in doc["blind_spots"]), doc
@@ -277,13 +303,23 @@ def check_reads(agent):
     assert found == [(1, "app_owner", "t_order", "TABLE", "catalog"),
                      (1, "app_owner", "t_order_audit", "TABLE", "text")], found
     found = tree(p.json("deps", "v_total", "--depth", "1"))
-    assert found == [(1, "app_owner", "f_order_total", "FUNCTION", "catalog"),
-                     (1, "app_owner", "t_order", "TABLE", "catalog")], found
-    ok("deps: a view's catalog, a trigger's table and the names in its body")
+    assert found == [(1, "app_owner", "f_order_total", "FUNCTION", view_how),
+                     (1, "app_owner", "t_order", "TABLE", view_how)], found
+    ok("deps: a view's " + ("definition" if MARIADB else "catalog")
+       + ", a trigger's table and the names in its body")
+    if MARIADB:
+        found = tree(p.json("impact", "s_order"))
+        assert found == [(1, "app_owner", "p_order_number", "PROCEDURE", "text")], found
+        src = p.json("src", "pkg_order")["rows"]
+        assert src[0]["TEXT"] == ("CREATE DEFINER=`root`@`%` PACKAGE "
+                                  "`app_owner`.`pkg_order`"), src[0]
+        ok("impact of a sequence; src of a package and its body")
 
     doc = p.json("errors")
     assert [(r["NAME"], r["TYPE"]) for r in doc["rows"]] == [("v_note", "VIEW")], doc
     assert "p_broken" in doc["blind_spot"] and doc["verified"] is False, doc
+    if MARIADB:                  # CHECK TABLE names the cause, not just the view
+        assert "app_owner.t_note" in doc["rows"][0]["MESSAGE"], doc["rows"]
     assert p.json("errors", "v_total")["verified"] is True
     doc = p.json("errors", "p_broken")
     assert doc["rows"] == [] and "only when it runs" in doc["blind_spot"], doc
@@ -356,6 +392,8 @@ def check_ddl_round_trip(entry, agent):
     objects = ["t_order", "t_order_line", "t_order_audit", "v_order_summary",
                "f_order_total", "v_total", "p_order_paid", "p_order_count", "p_broken",
                "ev_purge_audit"]
+    if MARIADB:
+        objects += ["p_order_number", "s_order", "pkg_order"]
     for name in objects:
         script = p.text("ddl", name).replace("`app_owner`.", f"`{COPY}`.") \
                                     .replace("app_owner.", f"{COPY}.")
@@ -363,7 +401,11 @@ def check_ddl_round_trip(entry, agent):
     for table in ("t_order", "t_order_line", "t_order_audit"):
         assert normalized_create(entry, "app_owner", table) == \
             normalized_create(entry, COPY, table), table
-    ok("ddl: every table rebuilt to the same SHOW CREATE TABLE")
+    if MARIADB:
+        assert rows(entry, "show create sequence app_owner.s_order")[0][1] == \
+            rows(entry, f"show create sequence {COPY}.s_order")[0][1]
+    ok("ddl: every table rebuilt to the same SHOW CREATE TABLE"
+       + (", and the sequence to the same SHOW CREATE SEQUENCE" if MARIADB else ""))
     original, copy = catalog_of(entry, "app_owner"), catalog_of(entry, COPY)
     for what in CATALOG:
         theirs = [r for r in original[what] if not (what in ("columns", "views")
@@ -394,6 +436,20 @@ def body(entry, name):
 def view_ok(entry, schema, name):
     return scalar(entry, "select table_comment from information_schema.tables where "
                          f"table_schema = '{schema}' and table_name = '{name}'") == "VIEW"
+
+
+def check_mariadb_refuses_writes(entry):
+    """Until Phase 11b, every write to MariaDB is refused before it runs."""
+    p = Project(dict(entry, database="app_owner"))
+    p.policy(source="confirm", data_dml="confirm")
+    for name, text in (("p_new.sql", "create procedure p_new() begin end"),
+                       ("rows.sql", "update t_order set total = total where id = 1")):
+        p.file(name, text)
+        code, _, why = p.run("apply", name)
+        assert code == 1 and "writes to it from its next phase" in why, (name, code, why)
+    assert scalar(entry, "select count(*) from information_schema.routines "
+                         "where routine_name = 'p_new'") == 0
+    ok("writes to MariaDB are refused before anything runs, until Phase 11b")
 
 
 def check_writes(entry):
@@ -694,6 +750,7 @@ def main():
         print("SKIP live check: PYTHIA_MYSQL_LIVE_HOST is not set")
         return
     entry = admin_entry()
+    which_server(entry)
     check_connect(entry)
     if os.environ.get("PYTHIA_MYSQL_LIVE_DISPOSABLE") != "1":
         print("SKIP the rest: PYTHIA_MYSQL_LIVE_DISPOSABLE=1 is not set")
@@ -704,7 +761,10 @@ def main():
     check_reads(agent)
     check_read_session_refuses_writes(entry)
     check_ddl_round_trip(entry, agent)
-    check_writes(entry)
+    if MARIADB:
+        check_mariadb_refuses_writes(entry)
+    else:
+        check_writes(entry)
     print("OK")
 
 

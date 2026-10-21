@@ -36,8 +36,8 @@ from pythia_core.queries import contract_problems, query_binds  # noqa: E402
 
 import pythia_mysql  # noqa: E402
 from pythia_mysql import cli, read  # noqa: E402
-from pythia_mysql.catalog import (QUERY_BINDS, QUERY_DIR, fold, ident, like_contains,  # noqa: E402
-                                  literal, sql_of)
+from pythia_mysql.catalog import (MARIADB_DIR, MARIADB_QUERY_BINDS, QUERY_BINDS,  # noqa: E402
+                                  QUERY_DIR, fold, ident, like_contains, literal, sql_of)
 from pythia_mysql.engine import MySqlEngine  # noqa: E402
 
 
@@ -55,6 +55,7 @@ def expect_exit(fn, *needles):
 # --- a stand-in for PyMySQL, and a catalog answered by query file -----------------
 
 QUERY_TEXT = {sql_of(n): n for n in QUERY_BINDS}
+QUERY_TEXT.update({sql_of(n, mariadb=True): "mariadb/" + n for n in MARIADB_QUERY_BINDS})
 
 
 class DriverError(Exception):
@@ -87,9 +88,14 @@ class CatalogCursor:
 
 
 class CatalogConn:
+    server_info = "8.4.11"        # what the server sent when the connection opened
+
     def __init__(self, answers):
         self.answers, self.asked = answers, []
         self.closed, self.commits = False, 0
+
+    def get_server_info(self):
+        return self.server_info
 
     def cursor(self):
         return CatalogCursor(self)
@@ -364,24 +370,32 @@ def test_check_end_to_end_and_reads_are_refused_writes():
     assert conn.closed is True and conn.commits == 0
 
 
-def test_check_warns_below_mysql_8_4_and_on_mariadb_and_refuses_nothing():
-    for version, comment, said in (
-            ("8.0.43", "MySQL Community Server - GPL", "MySQL 8.0 is below pythia-mysql's floor, 8.4"),
-            ("5.7.44-log", "MySQL Community Server (GPL)", "MySQL 5.7 is below pythia-mysql's floor, 8.4"),
-            ("11.4.5-MariaDB-ubu2404", "mariadb.org binary distribution", "This server is MariaDB, not MySQL")):
+def test_check_warns_below_mysql_8_4_and_mariadb_10_11_and_refuses_nothing():
+    for version, comment, said, fake in (
+            ("8.0.43", "MySQL Community Server - GPL",
+             "MySQL 8.0 is below pythia-mysql's floor, 8.4", fake_pymysql),
+            ("5.7.44-log", "MySQL Community Server (GPL)",
+             "MySQL 5.7 is below pythia-mysql's floor, 8.4", fake_pymysql),
+            ("10.6.21-MariaDB-ubu2004", "mariadb.org binary distribution",
+             "MariaDB 10.6 is below pythia-mysql's MariaDB floor, 10.11", fake_mariadb)):
         answers = dict(BASIC)
         answers["server-version.sql"] = (("version", "edition", "database_name"),
                                          [(version, comment, "app_owner")])
-        with fake_pymysql(answers), project(DEV):
+        with fake(answers), project(DEV):
             code, out, _ = run("check")
         assert code == 0 and f"! {said}" in out, out
-    for version in ("8.4.0", "9.5.0"):
+    for version, fake in (("8.4.0", fake_pymysql), ("9.5.0", fake_pymysql),
+                          ("10.11.14-MariaDB-0ubuntu0.24.04.1", fake_mariadb),
+                          ("11.8.9-MariaDB-ubu2404", fake_mariadb)):
         answers = dict(BASIC)
         answers["server-version.sql"] = (("version", "edition", "database_name"),
-                                         [(version, "MySQL Community Server - GPL", "app_owner")])
-        with fake_pymysql(answers), project(DEV):
+                                         [(version, "any", "app_owner")])
+        with fake(answers), project(DEV):
             code, out, _ = run("check", "--json")
-        assert code == 0 and json.loads(out)["below_floor"] is None, version
+        doc = json.loads(out)
+        assert code == 0 and doc["below_floor"] is None, version
+        server = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}["server"]
+        assert server.startswith("MariaDB " if "MariaDB" in version else "MySQL "), server
 
 
 def test_check_reports_where_unqualified_names_land():
@@ -535,14 +549,15 @@ def test_a_trigger_after_another_says_which():
         "BEFORE INSERT ON `app_owner`.`t_order` FOR EACH ROW FOLLOWS `trg_a`")
 
 
-TABLE_HEAD = ("engine", "charset", "collation", "options", "comment", "partitioned")
+TABLE_HEAD = ("engine", "charset", "collation", "options", "comment", "partitioned",
+              "versioned")
 TABLE_COLS = ("name", "type", "nullable", "default_value", "extra", "generation",
               "charset", "collation", "comment", "srs_id")
 INDEX_COLS = ("name", "non_unique", "seq", "column_name", "sub_part", "direction",
               "index_type", "expression", "visible", "comment")
 FK_COLS = ("name", "column_name", "ref_schema", "ref_table", "ref_column", "on_update",
            "on_delete")
-CHECK_COLS = ("name", "clause", "enforced")
+CHECK_COLS = ("name", "clause", "enforced", "level")
 
 
 def table_catalog(partitioned=0, triggers=()):
@@ -550,7 +565,7 @@ def table_catalog(partitioned=0, triggers=()):
         "resolve.sql": resolving(T_ORDER),
         "table-head.sql": (TABLE_HEAD, [("InnoDB", "utf8mb4", "utf8mb4_0900_ai_ci",
                                          "row_format=DYNAMIC stats_persistent=1 partitioned",
-                                         "Orders, 'all'", partitioned)]),
+                                         "Orders, 'all'", partitioned, 0)]),
         "table-columns.sql": (TABLE_COLS, [
             ("id", "bigint unsigned", "NO", None, "auto_increment", "", None, None, "", None),
             ("code", "varchar(20)", "NO", None, "", "", "latin1", "latin1_bin", "it's", None),
@@ -578,8 +593,8 @@ def table_catalog(partitioned=0, triggers=()):
         "table-foreign-keys.sql": (FK_COLS, [
             ("fk_parent", "id", "app_owner", "t_parent", "id", "NO ACTION", "CASCADE"),
             ("fk_other", "code", "reporting", "t_code", "code", "RESTRICT", "NO ACTION")]),
-        "table-checks.sql": (CHECK_COLS, [("ck_total", "(`total` >= 0)", "YES"),
-                                          ("ck_ratio", "(`ratio` < 1)", "NO")]),
+        "table-checks.sql": (CHECK_COLS, [("ck_total", "(`total` >= 0)", "YES", "Table"),
+                                          ("ck_ratio", "(`ratio` < 1)", "NO", "Table")]),
         "triggers.sql": (TRIGGER_COLS, list(triggers)),
     })
 
@@ -632,7 +647,7 @@ def test_expressions_lose_the_escaping_information_schema_adds():
     conn.answers["table-indexes.sql"] = (INDEX_COLS, [
         ("ix_q", 1, 1, None, None, "A", "BTREE", "concat(`a`,_utf8mb4\\'k\\')", "YES", "")])
     conn.answers["table-checks.sql"] = (CHECK_COLS, [
-        ("ck_q", "(`a` in (_utf8mb4\\'DRAFT\\',_utf8mb4\\'PAID\\'))", "YES")])
+        ("ck_q", "(`a` in (_utf8mb4\\'DRAFT\\',_utf8mb4\\'PAID\\'))", "YES", "Table")])
     conn.answers["table-foreign-keys.sql"] = (FK_COLS, [])
     ddl = read.ddl(conn, "app_owner", "t_order")
     assert "  `a` varchar(20) DEFAULT 'it''s',\n" in ddl, ddl
@@ -1622,6 +1637,316 @@ def test_the_package_says_what_it_is_on_pypi():
     for needle in ('readme = "README.md"', '"Programming Language :: Python :: 3.9"',
                    '"Programming Language :: Python :: 3.13"', "Changelog = "):
         assert needle in text, needle
+
+
+# --- MariaDB (Phase 11a): the same reads, from MariaDB's catalog -----------------------
+
+MARIA_INFO = "11.8.9-MariaDB-ubu2404"
+
+
+def maria(answers, info=MARIA_INFO, script=None):
+    conn = ScriptConn(answers, script) if script else CatalogConn(answers)
+    conn.server_info = info
+    return conn
+
+
+@contextlib.contextmanager
+def fake_mariadb(answers=None):
+    with fake_pymysql(answers) as rec:
+        mod = sys.modules["pymysql"]
+        plain = mod.connect
+
+        def connect(**kw):
+            conn = plain(**kw)
+            conn.server_info = MARIA_INFO
+            return conn
+        mod.connect = connect
+        yield rec
+
+
+def test_mariadb_is_known_by_what_it_sends_on_connecting():
+    from pythia_mysql.catalog import server
+    assert server(maria({})) == "MariaDB"
+    assert server(maria({}, info="5.5.5-10.11.14-MariaDB-0ubuntu0.24.04.1")) == "MariaDB"
+    assert server(CatalogConn({})) == "MySQL"
+    e = MySqlEngine()
+    with fake_pymysql():
+        e.connect(DEV["dev"])
+    assert e.label == "MySQL"
+    with fake_mariadb():
+        e.connect(DEV["dev"])
+    assert e.label == "MariaDB"          # what core prints names the server it reached
+
+
+def test_mariadb_reads_its_own_query_file_where_one_exists():
+    assert contract_problems(MARIADB_DIR, MARIADB_QUERY_BINDS, "pyformat") == []
+    for name, binds in MARIADB_QUERY_BINDS.items():
+        if name in QUERY_BINDS:            # in MySQL's place: the same binds
+            assert binds == QUERY_BINDS[name], name
+        body = "\n".join(line for line in sql_of(name, mariadb=True).splitlines()
+                         if not line.lstrip().startswith("--"))
+        assert '"' not in body and "||" not in body and "\\" not in body, name
+        sql_of(name, mariadb=True) % {b: "NULL" for b in binds}
+    # MySQL never runs a file written for MariaDB alone
+    only = sorted(set(MARIADB_QUERY_BINDS) - set(QUERY_BINDS))
+    assert only
+    for name in only:
+        expect_exit(lambda: sql_of(name), "MariaDB")
+    conn = maria({"mariadb/table-columns.sql": (TABLE_COLS, [])})
+    from pythia_mysql.catalog import q
+    q(conn, "table-columns.sql", s="app_owner", n="t_order")
+    q(conn, "routine.sql", s="app_owner", n="p_paid")
+    assert conn.names() == ["mariadb/table-columns.sql", "routine.sql"]
+
+
+def test_check_names_mariadb_and_its_floor():
+    e = MySqlEngine()
+    head = ("version", "edition", "database_name")
+    conn = maria({"server-version.sql": (head, [("11.8.9-MariaDB-ubu2404",
+                                                 "mariadb.org binary distribution", "app_owner")])})
+    assert e.server_version(conn) == ("MariaDB 11.8.9-MariaDB-ubu2404 (mariadb.org binary "
+                                      "distribution) — database app_owner")
+    assert e.floor_warning(conn) is None
+    for version, warns in (("10.11.14-MariaDB-0ubuntu0.24.04.1", False),
+                           ("10.6.21-MariaDB", True), ("11.4.5-MariaDB", False)):
+        conn = maria({"server-version.sql": (head, [(version, "x", "app_owner")])})
+        said = e.floor_warning(conn)
+        assert bool(said) == warns, (version, said)
+        if warns:
+            assert "10.11" in said and "MariaDB 10.6" in said
+    mysql = CatalogConn({"server-version.sql": (head, [("8.0.36", "MySQL", "app_owner")])})
+    assert "8.4" in e.floor_warning(mysql)
+
+
+def test_mariadb_hides_routines_behind_its_own_privileges():
+    def held(*lines):
+        return read.hidden_kinds(maria({"grants.sql": (("Grants",), [(g,) for g in lines])}),
+                                 "app_owner")
+    hidden = held("GRANT USAGE ON *.* TO `agent`@`%` IDENTIFIED BY PASSWORD '*69DF4E42'",
+                  "GRANT SELECT, SHOW VIEW ON `app_owner`.* TO `agent`@`%`")
+    assert set(hidden) == {"routine", "trigger", "event"}
+    assert "SHOW CREATE ROUTINE" in hidden["routine"] and "mysql.proc" in hidden["routine"]
+    assert "MariaDB hides" in hidden["trigger"] and "SHOW_ROUTINE" not in hidden["routine"]
+    # what a password hash looks like never leaves the grants
+    assert not any("IDENTIFIED" in v or "*69DF" in v for v in hidden.values())
+    # 11.3 and later: SHOW CREATE ROUTINE; 10.11: SELECT on mysql.proc, or everywhere
+    for routines in ("GRANT SHOW CREATE ROUTINE ON *.* TO `agent`@`%`",
+                     "GRANT SHOW CREATE ROUTINE ON `app_owner`.* TO `agent`@`%`",
+                     "GRANT SELECT ON `mysql`.`proc` TO `agent`@`%`",
+                     "GRANT SELECT ON `mysql`.* TO `agent`@`%`",
+                     "GRANT SELECT ON *.* TO `agent`@`%`"):
+        assert "routine" not in held(routines), routines
+    assert "routine" in held("GRANT SHOW CREATE ROUTINE ON `reporting`.* TO `agent`@`%`")
+    assert "routine" in held("GRANT SELECT ON `mysql`.`user` TO `agent`@`%`")
+    # a role's privileges are listed once it is active, and they count
+    assert held("GRANT `r_read` TO `agent`@`%`",
+                "GRANT SHOW CREATE ROUTINE ON *.* TO `agent`@`%`",
+                "GRANT USAGE ON *.* TO `r_read`",
+                "GRANT TRIGGER, EVENT ON `app_owner`.* TO `r_read`",
+                "SET DEFAULT ROLE `r_read` FOR `agent`@`%`") == {}
+
+
+SEQ = ("app_owner", "s_order", "SEQUENCE")
+PKG = ("app_owner", "pkg_order", "PACKAGE")
+PKG_BODY = ("app_owner", "pkg_order", "PACKAGE BODY")
+ORACLE_MODE = "PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ORACLE,NO_KEY_OPTIONS"
+
+
+def test_mariadb_packages_read_as_two_units():
+    rows = [("PACKAGE BODY", "pkg_order", None, None, "NO", "CONTAINS SQL", "DEFINER", "",
+             "root@%", ORACLE_MODE, None, "as function f return int as begin return 1; end;"
+             "\nend", "utf8mb4"),
+            ("PACKAGE", "pkg_order", None, None, "NO", "CONTAINS SQL", "DEFINER", "",
+             "root@%", ORACLE_MODE, None, "as function f return int;\nend", "utf8mb4")]
+    conn = maria({"resolve.sql": resolving(PKG, PKG_BODY),
+                  "routine.sql": (ROUTINE_COLS, rows),
+                  "routine-params.sql": (PARAM_COLS, [])})
+    src = read.source(conn, "app_owner", "pkg_order")
+    assert src[0] == ("pkg_order (PACKAGE)", 1,
+                      "CREATE DEFINER=`root`@`%` PACKAGE `app_owner`.`pkg_order`"), src
+    assert src[1] == ("pkg_order (PACKAGE)", 2, "as function f return int;")
+    assert ("pkg_order (PACKAGE BODY)", 1,
+            "CREATE DEFINER=`root`@`%` PACKAGE BODY `app_owner`.`pkg_order`") in src
+    ddl = read.ddl(conn, "app_owner", "pkg_order")
+    assert f"-- created under sql_mode={ORACLE_MODE}" in ddl
+    assert ddl.index("PACKAGE `app_owner`") < ddl.index("PACKAGE BODY `app_owner`")
+    # a package is Oracle syntax: the ddl sets the mode it needs, then puts
+    # the session's own back
+    assert (f"SET @pythia_sql_mode = @@sql_mode;\nSET SESSION sql_mode = '{ORACLE_MODE}';\n"
+            "DELIMITER //") in ddl, ddl
+    assert ddl.endswith("DELIMITER ;\nSET SESSION sql_mode = @pythia_sql_mode;"), ddl
+    # a procedure keeps its mode as a note: it parses in any
+    assert "SET SESSION sql_mode" not in read.ddl(routine_catalog(), "app_owner", "p_paid")
+
+
+def test_mariadb_sequences_are_listed_and_rebuilt():
+    def show_create(sql):
+        assert sql.strip().lower().endswith("show create sequence `app_owner`.`s_order`"), sql
+        return (("Table", "Create Table"), [(
+            "s_order", "CREATE SEQUENCE `s_order` start with 100 minvalue 1 maxvalue "
+            "9223372036854775806 increment by 5 cache 10 nocycle ENGINE=InnoDB")], 1)
+    conn = maria({"resolve.sql": resolving(SEQ)}, script=show_create)
+    ddl = read.ddl(conn, "app_owner", "s_order")
+    assert ("CREATE SEQUENCE `app_owner`.`s_order` start with 100 minvalue 1 maxvalue "
+            "9223372036854775806 increment by 5 cache 10 nocycle ENGINE=InnoDB;") in ddl, ddl
+    assert "SHOW CREATE SEQUENCE" in ddl and "starts again" in ddl
+    assert read.source(conn, "app_owner", "s_order") == []
+    for name in ("object-names.sql", "resolve.sql"):
+        assert "'SEQUENCE'" in sql_of(name), name
+
+
+M_TABLE_COLS = TABLE_COLS
+M_INDEX_COLS = INDEX_COLS
+
+
+def mariadb_table():
+    return maria({
+        "resolve.sql": resolving(T_ORDER),
+        "mariadb/table-head.sql": (TABLE_HEAD, [("InnoDB", "utf8mb4", "utf8mb4_unicode_ci", "",
+                                                 "Orders", 0, 0)]),
+        "mariadb/table-columns.sql": (TABLE_COLS, [
+            ("id", "bigint(20) unsigned", "NO", None, "auto_increment", None, None, None, "",
+             None),
+            ("status", "varchar(10)", "NO", "'DRAFT'", "", None, "utf8mb4",
+             "utf8mb4_unicode_ci", "DRAFT until paid", None),
+            ("total", "decimal(12,2)", "NO", "0.00", "", None, None, None, "", None),
+            ("note", "varchar(40)", "YES", "NULL", "", None, "latin1", "latin1_bin", "", None),
+            ("created", "timestamp(3)", "NO", "current_timestamp(3)",
+             "on update current_timestamp(3)", None, None, None, "", None),
+            ("token", "char(36)", "NO", "uuid()", "", None, "utf8mb4", "utf8mb4_unicode_ci",
+             "", None),
+            ("twice", "decimal(13,2)", "YES", "NULL", "VIRTUAL GENERATED", "`total` * 2",
+             None, None, "", None),
+            ("qty", "int(11)", "NO", None, "", None, None, None, "", None)]),
+        "mariadb/table-indexes.sql": (INDEX_COLS, [
+            ("PRIMARY", 0, 1, "id", None, "A", "BTREE", None, "YES", ""),
+            ("ix_order_note", 1, 1, "note", 8, "A", "BTREE", None, "NO", "by note")]),
+        "table-foreign-keys.sql": (FK_COLS, []),
+        "mariadb/table-checks.sql": (CHECK_COLS, [
+            ("ck_order_status", "`status` in ('DRAFT','PAID')", "YES", "Table"),
+            ("qty", "`qty` > 0", "YES", "Column")]),
+        "triggers.sql": (TRIGGER_COLS, []),
+        "grants.sql": (("Grants",), [(g,) for g in ALL_SEEN])})
+
+
+def test_a_mariadb_table_is_rebuilt_as_mariadb_prints_it():
+    ddl = read.ddl(mariadb_table(), "app_owner", "t_order")
+    body = ddl[ddl.index("CREATE TABLE"):]
+    assert body == (
+        "CREATE TABLE `app_owner`.`t_order` (\n"
+        "  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,\n"
+        "  `status` varchar(10) NOT NULL DEFAULT 'DRAFT' COMMENT 'DRAFT until paid',\n"
+        "  `total` decimal(12,2) NOT NULL DEFAULT 0.00,\n"
+        "  `note` varchar(40) CHARACTER SET latin1 COLLATE latin1_bin DEFAULT NULL,\n"
+        "  `created` timestamp(3) NOT NULL DEFAULT current_timestamp(3) "
+        "ON UPDATE current_timestamp(3),\n"
+        "  `token` char(36) NOT NULL DEFAULT uuid(),\n"
+        "  `twice` decimal(13,2) GENERATED ALWAYS AS (`total` * 2) VIRTUAL,\n"
+        "  `qty` int(11) NOT NULL CHECK (`qty` > 0),\n"
+        "  PRIMARY KEY (`id`),\n"
+        "  KEY `ix_order_note` (`note`(8)) COMMENT 'by note' IGNORED,\n"
+        "  CONSTRAINT `ck_order_status` CHECK (`status` in ('DRAFT','PAID'))\n"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci "
+        "COMMENT='Orders';"), body
+    conn = mariadb_table()
+    conn.answers["mariadb/table-head.sql"] = (TABLE_HEAD, [("InnoDB", "utf8mb4",
+                                                            "utf8mb4_unicode_ci", "", "", 0, 1)])
+    assert "-- system-versioned: WITH SYSTEM VERSIONING" in read.ddl(conn, "app_owner", "t_order")
+
+
+TREE = ("schema_name", "name", "type")
+
+
+def test_mariadb_impact_reads_view_definitions_not_a_usage_table():
+    catalog = {("app_owner", "t_order", "TABLE"): [("app_owner", "t_line", "TABLE"),
+                                                   ("app_owner", "trg_order_audit", "TRIGGER")]}
+    views = {("app_owner", "t_order"): [("app_owner", "v_paid", "VIEW"),
+                                        ("reporting", "v_report", "VIEW")],
+             ("app_owner", "f_total"): [("app_owner", "v_total", "VIEW")]}
+    conn = maria({
+        "resolve.sql": resolving(T_ORDER, F_TOTAL),
+        "mariadb/dependents-catalog.sql": lambda b: (TREE, catalog.get((b["s"], b["n"], b["t"]),
+                                                                       [])),
+        "mariadb/view-dependents.sql": lambda b: (TREE, views.get((b["s"], b["n"]), [])),
+        "dependents-text.sql": lambda b: (TREE + ("definition",), [
+            ("app_owner", "p_paid", "PROCEDURE", "update t_order set status = 'PAID'")]
+            if "t!_order" in b["p"] else []),
+        "grants.sql": (("Grants",), [(g,) for g in ALL_SEEN])})
+    rows, blind = read.dependents(conn, "app_owner", "t_order", 1)
+    assert rows == [
+        (1, "app_owner", "t_line", "TABLE", "catalog"),
+        (1, "app_owner", "trg_order_audit", "TRIGGER", "catalog"),
+        (1, "app_owner", "v_paid", "VIEW", "definition"),
+        (1, "reporting", "v_report", "VIEW", "definition"),
+        (1, "app_owner", "p_paid", "PROCEDURE", "text")], rows
+    assert any("MariaDB records no dependencies" in b and "definition" in b for b in blind)
+    assert not any("view_table_usage" in n for n in conn.names())
+    rows, _ = read.dependents(conn, "app_owner", "f_total", 1)
+    assert rows == [(1, "app_owner", "v_total", "VIEW", "definition")], rows
+
+
+def test_mariadb_deps_of_a_view_come_from_its_definition():
+    conn = maria({
+        "resolve.sql": resolving(V_PAID),
+        "mariadb/dependencies-catalog.sql": (TREE, []),
+        "mariadb/view-dependencies.sql": lambda b: (TREE, [
+            ("app_owner", "f_total", "FUNCTION"), ("app_owner", "t_order", "TABLE")]
+            if b["n"] == "v_paid" else []),
+        "grants.sql": (("Grants",), [(g,) for g in ALL_SEEN])})
+    rows, _ = read.dependencies(conn, "app_owner", "v_paid", 1)
+    assert rows == [(1, "app_owner", "f_total", "FUNCTION", "definition"),
+                    (1, "app_owner", "t_order", "TABLE", "definition")], rows
+
+
+def check_table(broken):
+    """CHECK TABLE as MariaDB answers it: the cause first, then the view's own
+    error, then 'Corrupt'; 'OK' for a sound view."""
+    def answer(sql):
+        assert sql.strip().lower().startswith("check table ") or "check table" in sql.lower()
+        named = re.findall(r"`app_owner`\.`(\w+)`", sql)
+        rows = []
+        for v in named:
+            if v in broken:
+                rows += [(f"app_owner.{v}", "check", "Error", broken[v]),
+                         (f"app_owner.{v}", "check", "Error",
+                          f"View 'app_owner.{v}' references invalid table(s) or column(s) or "
+                          "function(s) or definer/invoker of view lack rights to use them"),
+                         (f"app_owner.{v}", "check", "error", "Corrupt")]
+            else:
+                rows.append((f"app_owner.{v}", "check", "status", "OK"))
+        return ("Table", "Op", "Msg_type", "Msg_text"), rows, len(rows)
+    return answer
+
+
+def test_mariadb_errors_check_every_view_and_give_the_cause():
+    conn = maria({
+        "resolve.sql": resolving(T_ORDER, V_PAID, P_PAID, ("app_owner", "v_note", "VIEW")),
+        "mariadb/views.sql": lambda b: (("name",), [
+            (n,) for n in ("v_note", "v_paid") if b["n"] in (None, n)]),
+        "unchecked.sql": (("name", "type"), [("pkg_order", "PACKAGE"), ("p_late", "PROCEDURE")]),
+        "grants.sql": (("Grants",), [(g,) for g in ALL_SEEN])},
+        script=check_table({"v_note": "Table 'app_owner.t_note' doesn't exist"}))
+    rows, blind = read.compile_errors(conn, "app_owner", None)
+    assert rows == [("v_note", "VIEW", None, None, "error",
+                     "Table 'app_owner.t_note' doesn't exist")], rows
+    assert "MariaDB resolves the names" in blind and "pkg_order" in blind
+    assert "check table `app_owner`.`v_note`, `app_owner`.`v_paid`" in conn.texts[0].lower()
+    assert read.compile_errors(conn, "app_owner", "v_paid") == ([], None)
+    rows, blind = read.compile_errors(conn, "app_owner", "v_note")
+    assert len(rows) == 1 and blind is None
+    assert not any(n == "view-errors.sql" for n in conn.names())
+    # no view, no CHECK TABLE at all
+    empty = maria({"mariadb/views.sql": (("name",), []), "unchecked.sql": (("name", "type"), []),
+                   "grants.sql": (("Grants",), [(g,) for g in ALL_SEEN])},
+                  script=check_table({}))
+    assert read.compile_errors(empty, "app_owner", None) == ([], None) and empty.texts == []
+
+
+def test_mariadb_is_read_only_until_its_write_path_lands():
+    conn = maria({})
+    ident = write.parse_object("create procedure p_new() begin end", "source")
+    expect_exit(lambda: write.snapshot(conn, "app_owner", "source", ident),
+                "MariaDB", "reads")
 
 
 def main():

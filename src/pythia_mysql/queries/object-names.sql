@@ -3,7 +3,9 @@
 -- Returns: NAME, TYPE, CREATED, MODIFIED
 select o.name, o.type, o.created, o.modified
   from (select table_name  as name,
-               case table_type when 'VIEW' then 'VIEW' else 'TABLE' end as type,
+               case table_type when 'VIEW' then 'VIEW'
+                               when 'SEQUENCE' then 'SEQUENCE'
+                               else 'TABLE' end as type,
                create_time as created,
                null        as modified
           from information_schema.tables

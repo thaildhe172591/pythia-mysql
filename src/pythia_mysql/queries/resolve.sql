@@ -1,11 +1,13 @@
--- Purpose: the objects in a schema holding a name — tables and views share
---          one namespace, procedures, functions, triggers and events each
+-- Purpose: the objects in a schema holding a name — tables, views and
+--          MariaDB's sequences share one namespace, procedures, functions, triggers and events each
 --          have their own — so the walks start from every one of them
 -- Binds:   %(s)s schema, %(n)s object name (quoting already removed)
 -- Returns: SCHEMA_NAME, NAME, TYPE
 select table_schema as schema_name,
        table_name   as name,
-       case table_type when 'VIEW' then 'VIEW' else 'TABLE' end as type
+       case table_type when 'VIEW' then 'VIEW'
+                       when 'SEQUENCE' then 'SEQUENCE'
+                       else 'TABLE' end as type
   from information_schema.tables
  where table_schema = %(s)s
    and table_name = %(n)s

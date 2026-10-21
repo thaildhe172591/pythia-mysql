@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.0.dev0 — unreleased
+
+### Phase 11a: MariaDB, read
+
+pythia-mysql reads MariaDB 10.11 and later through the same commands.
+
+- **The server is known on connecting**, by the version MariaDB sends;
+  `check` names it, and so does every message core prints. MariaDB's floor
+  is 10.11 LTS: below it, `check` warns.
+- **MariaDB's own queries** (`queries/mariadb/`) answer where its catalog
+  differs from MySQL's, with the same binds and columns.
+- **Views are read in their stored definitions**, where MariaDB writes every
+  name `` `schema`.`name` ``: `impact` and `deps` mark those rows
+  `definition`. MariaDB records no dependencies at all.
+- **`errors` runs `CHECK TABLE`** over the views and reports the cause
+  MariaDB gives first; MariaDB marks no view invalid.
+- **Privileges as MariaDB names them**: `SHOW CREATE ROUTINE` (11.3 and
+  later) or `SELECT` on `mysql.proc` (10.11) for routines; the password hash
+  in its `SHOW GRANTS` lines is never printed.
+- **Sequences and packages are read**: a sequence's `ddl` is its `SHOW CREATE
+  SEQUENCE`, qualified; a package and its body are two units, and their
+  `ddl` sets the `sql_mode=ORACLE` they need. A column-level `CHECK` and an
+  `IGNORED` index are rebuilt as MariaDB prints them.
+- **Writes to MariaDB are refused** before anything runs, until Phase 11b.
+- `table-head.sql` and `table-checks.sql` gain a column each (`versioned`,
+  `level`), shared with MariaDB's; `ls` and the walks know `SEQUENCE`.
+- The live check runs on MariaDB 10.11, 11.4 and 11.8 too
+  (`tests/fixtures/app_owner_mariadb.sql`).
+
 ## 0.1.0 — 2026-10-21
 
 The first release: Alpha. It needs pythia-core 0.1.1.

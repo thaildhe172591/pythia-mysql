@@ -1,9 +1,11 @@
 -- Purpose: a table's CHECK constraints, and whether each is enforced
 -- Binds:   %(s)s schema, %(n)s table name
--- Returns: NAME, CLAUSE, ENFORCED
+-- Returns: NAME, CLAUSE, ENFORCED, LEVEL (always 'Table': MySQL makes a
+--          column's check a table's)
 select tc.constraint_name as name,
        cc.check_clause    as clause,
-       tc.enforced        as enforced
+       tc.enforced        as enforced,
+       'Table'            as level
   from information_schema.table_constraints tc
   join information_schema.check_constraints cc
     on cc.constraint_schema = tc.constraint_schema

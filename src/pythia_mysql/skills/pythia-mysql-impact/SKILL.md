@@ -38,14 +38,17 @@ NO CHANGE PROPOSED WITHOUT ITS IMPACT MEASURED FIRST
 | 1–9 dependents | List them to the developer alongside the proposal. |
 | `! show this list to the developer` (10+, or one in another schema) | Show the tree and get an explicit go-ahead **before writing any code**. |
 | `[text]` rows | Leads found by name in routine, trigger and event bodies: name them as such. |
+| `definition` rows (MariaDB) | Read in a view's stored definition, where MariaDB names every object `schema`.`name`. |
 | `-- blind spot:` lines | Relay them. Never call the list complete. |
 
 What counts: views that read a table or view or call a function (the
 catalog), the triggers on a table, tables whose foreign keys point at it —
 and every procedure, function, trigger and event whose body names it, in
-any schema this account can see (`[text]`). MySQL hides routines, triggers
-and events from an account without `SHOW_ROUTINE`, `TRIGGER` or `EVENT`;
-the blind spots say when.
+any schema this account can see (`[text]`). MariaDB records no view
+usage: its views are read in their definitions instead. The server hides
+routines, triggers and events from an account without `SHOW_ROUTINE`
+(MariaDB: `SHOW CREATE ROUTINE`, or `SELECT` on `mysql.proc`), `TRIGGER`
+or `EVENT`; the blind spots say when.
 
 ## Red Flags — STOP if you catch yourself thinking
 

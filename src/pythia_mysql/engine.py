@@ -1,4 +1,4 @@
-"""MySQL, through PyMySQL, as a pythia-core engine.
+"""MySQL and MariaDB, through PyMySQL, as a pythia-core engine.
 
 It answers the connect tier (here), the read tier (read.py), the write,
 predict and release tiers (write.py), the lint tier (rules.py) and the
@@ -7,6 +7,10 @@ connection's "database" is where unqualified names land, and "schema",
 when it is set, is what pythia reads (check says when the two differ).
 MySQL commits DDL as it runs it, so data is rehearsed in a transaction and
 DDL is predicted, written once after the approval, and read back.
+
+MariaDB is read through the same tiers: catalog.server tells the two apart
+from what the server sent on connecting, and MariaDB's own query files
+answer where its catalog differs (catalog.py).
 """
 import copy
 import os
@@ -15,9 +19,11 @@ import ssl
 import sys
 
 from . import __version__, guard, read, write
-from .catalog import QUERY_BINDS, QUERY_DIR, fold, ident, q  # noqa: F401 — QUERY_* re-exported
+from .catalog import (MARIADB, QUERY_BINDS, QUERY_DIR, fold, ident, q,  # noqa: F401 — QUERY_*
+                      server)                                       # re-exported
 
 FLOOR = (8, 4)          # MySQL 8.4 LTS: the oldest CI tests
+MARIADB_FLOOR = (10, 11)  # MariaDB 10.11 LTS: the oldest CI tests
 CONFIG_REL = ".pythia/mysql/connections.json"
 REQUIRED = ("host", "database", "user")
 TLS = ("off", "request", "require", "verify")
@@ -37,7 +43,8 @@ class MySqlEngine:
     rollback_notes = {
         "source": "Yes — the definition is snapshotted before every write; a new "
                   "object's undo is a DROP. A routine whose body this account "
-                  "cannot read (no SHOW_ROUTINE) is refused.",
+                  "cannot read (no SHOW_ROUTINE on MySQL, no SHOW CREATE ROUTINE "
+                  "or SELECT on mysql.proc on MariaDB) is refused.",
         "comments": "Yes — the previous table comment is snapshotted.",
         "data_dml": "No. After commit only a backup, or the binary log replayed "
                     "to a point in time, brings rows back. Revalidation checks "
@@ -94,7 +101,7 @@ class MySqlEngine:
             kw["ssl"] = ssl.create_default_context(cafile=ca or None)
         # "request": PyMySQL's own default — TLS whenever the server offers it
         try:
-            return pymysql.connect(**kw)
+            conn = pymysql.connect(**kw)
         except RuntimeError as exc:
             if "cryptography" not in str(exc):
                 raise
@@ -104,6 +111,9 @@ class MySqlEngine:
                      f"password. Let the server offer TLS and set \"tls\": "
                      f"\"request\" or stronger in {CONFIG_REL}, or pip install "
                      "cryptography.")
+        # what core prints names the server this command reached
+        self.label = server(conn)
+        return conn
 
     def session(self, conn, readonly):
         # a read command's session refuses every write, DDL included: a READ
@@ -169,20 +179,25 @@ class MySqlEngine:
 
     def server_version(self, conn):
         version, edition, database = q(conn, "server-version.sql")[1][0]
-        return f"MySQL {version} ({edition}) — database {database}"
+        return f"{server(conn)} {version} ({edition}) — database {database}"
 
     def floor_warning(self, conn):
-        """Below MySQL 8.4 LTS, the oldest version CI tests, or not MySQL at
-        all: said by `check`, never refused (pythia-core DESIGN.md §8)."""
-        version, edition, _db = q(conn, "server-version.sql")[1][0]
-        if "mariadb" in f"{version} {edition}".lower():
-            return ("This server is MariaDB, not MySQL: pythia-mysql is tested on "
-                    "MySQL 8.4 to 9.5 only, and reads MySQL's catalog, which "
-                    "MariaDB's differs from. Expect some commands to fail.")
-        m = re.match(r"(\d+)\.(\d+)", str(version))
-        if not m or (int(m.group(1)), int(m.group(2))) >= FLOOR:
+        """Below MySQL 8.4 LTS or MariaDB 10.11 LTS, the oldest versions CI
+        tests: said by `check`, never refused (pythia-core DESIGN.md §8)."""
+        version = q(conn, "server-version.sql")[1][0][0]
+        m = re.match(r"(?:5\.5\.5-)?(\d+)\.(\d+)", str(version))
+        if not m:
             return None
-        return (f"MySQL {m.group(1)}.{m.group(2)} is below pythia-mysql's floor, "
+        found = (int(m.group(1)), int(m.group(2)))
+        if server(conn) == MARIADB:
+            if found >= MARIADB_FLOOR:
+                return None
+            return (f"MariaDB {found[0]}.{found[1]} is below pythia-mysql's MariaDB "
+                    "floor, 10.11: it is not tested there (CI runs 10.11 to 11.8), "
+                    "and MariaDB no longer supports it. Most commands may still work.")
+        if found >= FLOOR:
+            return None
+        return (f"MySQL {found[0]}.{found[1]} is below pythia-mysql's floor, "
                 "8.4: it is not tested there (CI runs 8.4 to 9.5), and Oracle no "
                 "longer supports it. Most commands may still work.")
 

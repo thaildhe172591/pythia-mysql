@@ -2,7 +2,7 @@
 
 **English** · [Tiếng Việt](https://github.com/thaildhe172591/pythia-mysql/blob/main/README.vi.md)
 
-pythia for MySQL: stored-program development for AI agents, built on
+pythia for MySQL and MariaDB: stored-program development for AI agents, built on
 [pythia-core](https://github.com/thaildhe172591/pythia-core). It aims to do
 what [pythia](https://github.com/thaildhe172591/pythia) does on Oracle and
 its siblings do on PostgreSQL, SQL Server and MongoDB: the agent learns
@@ -20,8 +20,13 @@ the session brief, the approval doors and the `pythia-mysql-*` skills.
 | writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
+**MariaDB (Phase 11a, on main, not yet on PyPI):** every read command, from
+MariaDB's own catalog. Writes to MariaDB are refused before anything runs
+until Phase 11b.
+
 MySQL 8.4 LTS is the floor: CI runs the whole live check on 8.4, 9.4 and
-9.5, and below 8.4 — or on MariaDB — `check` says so (nothing is refused).
+9.5. MariaDB's floor is 10.11 LTS: CI runs the reads on 10.11, 11.4 and
+11.8. Below either floor `check` says so (nothing is refused).
 
 ## Install
 
@@ -170,6 +175,39 @@ rest.
 - **Reads cannot write.** Every read command's session is `READ ONLY`, and
   MySQL refuses DML and DDL alike there (error 1792). A read-only account is
   the first line.
+
+### MariaDB: the same reads, from its own catalog
+
+pythia-mysql knows MariaDB by the version it sends when the connection
+opens, and reads it with the same commands, through its own queries where
+its catalog differs from MySQL's (`queries/mariadb/`). `check` names the
+server, and every message names the one it reached.
+
+- **Views are read in their definitions.** MariaDB records no dependencies
+  at all — not even a view's — but stores each view's SELECT with every
+  table, view, function and sequence written `` `schema`.`name` ``.
+  `impact` and `deps` read them there and mark those rows `definition`; a
+  procedure, function, trigger, event or package body is still matched by
+  name (`[text]`).
+- **`errors` asks CHECK TABLE.** MariaDB marks no view invalid. `errors`
+  runs `CHECK TABLE` over the views, in the same `READ ONLY` session, and
+  reports each one MariaDB cannot open with the cause it gives first
+  (`Table 'app_owner.t_note' doesn't exist`).
+- **What MariaDB hides is its own privileges.** A routine another account
+  defined needs `SHOW CREATE ROUTINE` (MariaDB 11.3 and later), or `SELECT`
+  on `mysql.proc` (10.11); triggers and events need `TRIGGER` and `EVENT`,
+  as on MySQL. A role's privileges count once it is active. MariaDB's `SHOW
+  GRANTS` lines carry the password hash: pythia-mysql reads their privilege
+  lists and scopes, and prints none of them.
+- **What only MariaDB keeps is read too.** Sequences are listed, and their
+  `ddl` is MariaDB's own `SHOW CREATE SEQUENCE`, qualified (a copy starts
+  again at `START WITH`). Packages (`sql_mode=ORACLE`) are listed and read
+  as two units, the package and its body; their `ddl` sets the `sql_mode`
+  they need and puts the session's back. A column-level `CHECK` is rebuilt
+  on its column, an ignored index as `IGNORED`, and a system-versioned
+  table's `ddl` says that its versioning is not rebuilt.
+- **Writes wait for Phase 11b.** `apply` and `deploy` against MariaDB are
+  refused before anything runs, with nothing written.
 
 ### Writing: the gate
 
@@ -371,6 +409,13 @@ with `EVENT` — both also let it change them. Without them, pythia-mysql
 says that triggers and events are hidden; the live check runs every read
 command both ways.
 
+On MariaDB the routine privilege has another name, and 10.11 none at all:
+
+```sql
+GRANT SHOW CREATE ROUTINE ON *.* TO 'app_agent'@'%';   -- MariaDB 11.3 and later
+GRANT SELECT ON mysql.proc TO 'app_agent'@'%';         -- MariaDB 10.11
+```
+
 A write needs what the change needs, on its schema only — for example
 `INSERT, UPDATE, DELETE` for data, `CREATE, ALTER, DROP, INDEX, CREATE
 VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT` for DDL. An account
@@ -389,8 +434,9 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 CI runs the suite on Ubuntu, Windows and macOS, Python 3.9 and 3.13, and
 the live check — every read, every write path, a release, a lint finding in
 a real preview and a write under a lease — against MySQL 8.4, 9.4 and 9.5
-in service containers. It tests against the pythia-core branch of the same
-name when one exists.
+in service containers; against MariaDB 10.11, 11.4 and 11.8, every read, a
+`ddl` round trip of each object, and the refusal of every write. It tests
+against the pythia-core branch of the same name when one exists.
 
 ## License
 

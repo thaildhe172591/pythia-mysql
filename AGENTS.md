@@ -1,10 +1,11 @@
 # Working in this repository / with this tool
 
-pythia-mysql is pythia for MySQL, on pythia-core. It is alpha (0.1.0): it
-reads everything pythia's Learn movement needs, and writes through one gate
-— data rehearsed in a transaction, DDL predicted, written once and read
-back. `pythia-mysql install` wires a project: the guard, the session brief
-and the `pythia-mysql-*` skills (`using-pythia-mysql` routes).
+pythia-mysql is pythia for MySQL and MariaDB, on pythia-core. It is alpha
+(0.1.0): it reads everything pythia's Learn movement needs, and writes
+through one gate — data rehearsed in a transaction, DDL predicted, written
+once and read back. `pythia-mysql install` wires a project: the guard, the
+session brief and the `pythia-mysql-*` skills (`using-pythia-mysql`
+routes). MariaDB (Phase 11a) is read; writes to it are refused until 11b.
 
 ## Using pythia-mysql as an agent (Phase 9c)
 
@@ -21,10 +22,12 @@ and the `pythia-mysql-*` skills (`using-pythia-mysql` routes).
    found by name in procedure, function, trigger and event bodies — MySQL
    records none of their dependencies — not proofs. Relay the `blind spot`
    lines, and never call an impact list complete.
-4. **What MySQL hides is a blind spot, not an absence.** Without
-   `SHOW_ROUTINE`, `TRIGGER` or `EVENT`, MySQL hides routines, triggers or
-   events from this account; pythia-mysql says so. Never report "no
-   triggers" when a line says they are hidden.
+4. **What the server hides is a blind spot, not an absence.** Without
+   `SHOW_ROUTINE` (MariaDB: `SHOW CREATE ROUTINE`, or `SELECT` on
+   `mysql.proc` on 10.11), `TRIGGER` or `EVENT`, the server hides routines,
+   triggers or events from this account; pythia-mysql says so. Never report
+   "no triggers" when a line says they are hidden. On MariaDB, rows marked
+   `definition` were read in a view's stored definition.
 5. **Writes go through `pythia-mysql apply` (one statement per file) or
    `pythia-mysql deploy` (a release of data, one transaction) only.** Never
    write through the `mysql` client, MySQL Shell, Workbench, `mysqlimport`
@@ -90,10 +93,14 @@ and the `pythia-mysql-*` skills (`using-pythia-mysql` routes).
 - **Queries:** every SQL statement lives in `src/pythia_mysql/queries/`,
   one per file, pyformat binds only (`%(s)s`), a literal `%` written `%%`,
   the `-- Purpose / -- Binds / -- Returns` header, and an entry in
-  `QUERY_BINDS`. A query reads the same under any `sql_mode`: strings in
+  `QUERY_BINDS`. Where MariaDB's catalog differs, its file of the same name
+  in `queries/mariadb/` (same binds, same columns, declared in
+  `MARIADB_QUERY_BINDS`) answers in its place; a file only there is asked
+  of MariaDB only. A query reads the same under any `sql_mode`: strings in
   single quotes, `CONCAT` never `||`, no backslash in a literal (a `LIKE`
-  escapes with `'!'`). MySQL 8.4 is the floor: CI runs the live check on
-  8.4, 9.4 and 9.5, and nothing newer than 8.4 belongs in a query.
+  escapes with `'!'`). MySQL 8.4 and MariaDB 10.11 are the floors: CI
+  runs the live check on 8.4, 9.4, 9.5 and on MariaDB 10.11, 11.4, 11.8,
+  and nothing newer than either floor belongs in a query.
 - **Dependencies:** pythia-core and PyMySQL, nothing else (a test enforces
   it).
 - **Engine-neutral logic goes to pythia-core.** If an answer would be the

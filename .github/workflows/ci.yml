@@ -32,13 +32,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # the floor (8.4 LTS) up to the newest innovation release
-        mysql: ["8.4", "9.4", "9.5"]
+        # MySQL from its floor (8.4 LTS) to the newest innovation release;
+        # MariaDB from its floor (10.11 LTS) to the newest LTS
+        server: ["mysql:8.4", "mysql:9.4", "mysql:9.5",
+                 "mariadb:10.11", "mariadb:11.4", "mariadb:11.8"]
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: mysql:${{ matrix.mysql }}
+        image: ${{ matrix.server }}
         env:
+          # both images read it
           MYSQL_ROOT_PASSWORD: "CiOnly#Disposable1"
         ports: ["3306:3306"]
     steps:
@@ -51,7 +54,7 @@ jobs:
           python-version: "3.13"
       - run: pip install ./.core .
       # the image initialises, restarts, then listens: wait with PyMySQL
-      - name: wait for MySQL ${{ matrix.mysql }}
+      - name: wait for ${{ matrix.server }}
         run: |
           python - <<'PY'
           import time, pymysql
@@ -63,7 +66,7 @@ jobs:
               except pymysql.Error:
                   time.sleep(2)
           else:
-              raise SystemExit("MySQL did not answer")
+              raise SystemExit("the server did not answer")
           PY
       - run: python tests/live_check.py
         env:
@@ -88,4 +91,5 @@ jobs:
       # the console script and the queries must work outside the repo layout
       - run: cd /tmp && pythia-mysql version && pythia-mysql --help | grep -q impact
       - run: cd /tmp && python -c "from pythia_mysql.catalog import QUERY_BINDS, QUERY_DIR; assert all((QUERY_DIR / q).is_file() for q in QUERY_BINDS)"
+      - run: cd /tmp && python -c "from pythia_mysql.catalog import MARIADB_QUERY_BINDS as b, MARIADB_DIR as d; assert all((d / q).is_file() for q in b)"
       - run: cd /tmp && python -c "from pythia_mysql.guard import SKILLS_DIR as d; assert len(list(d.glob('*/SKILL.md'))) == 7 and (d / 'pythia-mysql-apply' / 'reference' / 'refusals.md').is_file()"

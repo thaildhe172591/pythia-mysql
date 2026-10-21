@@ -7,7 +7,8 @@ description: Use when starting any conversation that touches MySQL, a schema, a 
 
 **Phase:** Learn → Ask → Do — this page opens the right one
 
-pythia-mysql is pythia for MySQL. Its one job here is consistency: whether
+pythia-mysql is pythia for MySQL and MariaDB (read; writes to MariaDB wait
+for Phase 11b). Its one job here is consistency: whether
 a session measures the blast radius and asks before it writes should not
 depend on the agent's mood that day.
 

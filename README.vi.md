@@ -2,7 +2,7 @@
 
 [English](README.md) · **Tiếng Việt**
 
-pythia cho MySQL: phát triển stored program cho AI agent, xây trên
+pythia cho MySQL và MariaDB: phát triển stored program cho AI agent, xây trên
 [pythia-core](https://github.com/thaildhe172591/pythia-core). Nó nhắm làm
 được điều mà [pythia](https://github.com/thaildhe172591/pythia) làm trên
 Oracle và các engine anh em làm trên PostgreSQL, SQL Server và MongoDB:
@@ -20,8 +20,13 @@ bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-
 | ghi: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
+**MariaDB (Phase 11a, trên main, chưa lên PyPI):** mọi lệnh đọc, đọc từ
+catalog riêng của MariaDB. Mọi lần ghi vào MariaDB bị từ chối trước khi chạy
+gì cho tới Phase 11b.
+
 MySQL 8.4 LTS là phiên bản tối thiểu: CI chạy toàn bộ live check trên 8.4,
-9.4 và 9.5, và thấp hơn 8.4 — hoặc trên MariaDB — thì `check` nói rõ (không
+9.4 và 9.5. Với MariaDB, tối thiểu là 10.11 LTS: CI chạy các lệnh đọc trên
+10.11, 11.4 và 11.8. Thấp hơn một trong hai mức đó thì `check` nói rõ (không
 gì bị từ chối).
 
 ## Cài đặt
@@ -172,6 +177,40 @@ phần còn lại.
 - **Lệnh đọc không thể ghi.** Phiên của mọi lệnh đọc là `READ ONLY`, và
   MySQL từ chối cả DML lẫn DDL trong đó (lỗi 1792). Một tài khoản chỉ đọc là
   lớp bảo vệ đầu tiên.
+
+### MariaDB: cùng các lệnh đọc, từ catalog của chính nó
+
+pythia-mysql nhận ra MariaDB qua phiên bản nó gửi khi mở kết nối, và đọc nó
+bằng cùng các lệnh, qua query riêng ở những chỗ catalog của nó khác MySQL
+(`queries/mariadb/`). `check` nêu tên server, và mọi thông báo đều gọi đúng
+tên server đã kết nối tới.
+
+- **View được đọc trong định nghĩa của nó.** MariaDB không ghi lại phụ thuộc
+  nào cả — kể cả của view — nhưng lưu câu SELECT của mỗi view với mọi
+  table, view, function và sequence viết dạng `` `schema`.`name` ``.
+  `impact` và `deps` đọc chúng ở đó và đánh dấu các dòng ấy là
+  `definition`; thân procedure, function, trigger, event hay package vẫn
+  được khớp theo tên (`[text]`).
+- **`errors` hỏi CHECK TABLE.** MariaDB không đánh dấu view nào là hỏng.
+  `errors` chạy `CHECK TABLE` trên các view, trong cùng phiên `READ ONLY`, và
+  báo mỗi view MariaDB không mở được kèm nguyên nhân nó đưa ra đầu tiên
+  (`Table 'app_owner.t_note' doesn't exist`).
+- **Những gì MariaDB giấu theo quyền riêng của nó.** Một routine do tài khoản
+  khác định nghĩa cần `SHOW CREATE ROUTINE` (MariaDB 11.3 trở lên), hoặc
+  `SELECT` trên `mysql.proc` (10.11); trigger và event cần `TRIGGER` và
+  `EVENT`, như trên MySQL. Quyền của một role được tính khi role đó đang bật.
+  Các dòng `SHOW GRANTS` của MariaDB mang theo hash mật khẩu: pythia-mysql chỉ
+  đọc danh sách quyền và phạm vi của chúng, và không in dòng nào ra.
+- **Những gì chỉ MariaDB có cũng được đọc.** Sequence được liệt kê, và `ddl`
+  của nó là `SHOW CREATE SEQUENCE` của chính MariaDB, có thêm tên schema (bản
+  sao bắt đầu lại từ `START WITH`). Package (`sql_mode=ORACLE`) được liệt kê
+  và đọc thành hai phần, package và body của nó; `ddl` của chúng đặt
+  `sql_mode` cần thiết rồi trả lại sql_mode của phiên. Một `CHECK` mức cột
+  được dựng lại trên cột của nó, một index bị bỏ qua thành `IGNORED`, và
+  `ddl` của một table system-versioned nói rằng phần versioning không được
+  dựng lại.
+- **Ghi chờ Phase 11b.** `apply` và `deploy` vào MariaDB bị từ chối trước
+  khi chạy gì, không có gì được ghi.
 
 ### Ghi: cổng
 
@@ -374,6 +413,14 @@ khoản có `EVENT` — cả hai đều cho phép sửa chúng. Không có chún
 pythia-mysql nói rằng trigger và event bị giấu; live check chạy mọi lệnh đọc
 theo cả hai cách.
 
+Trên MariaDB, quyền đọc routine có tên khác, và 10.11 thì không có quyền
+riêng nào:
+
+```sql
+GRANT SHOW CREATE ROUTINE ON *.* TO 'app_agent'@'%';   -- MariaDB 11.3 and later
+GRANT SELECT ON mysql.proc TO 'app_agent'@'%';         -- MariaDB 10.11
+```
+
 Một lần ghi cần đúng những gì thay đổi đó cần, chỉ trên schema của nó — ví
 dụ `INSERT, UPDATE, DELETE` cho dữ liệu, `CREATE, ALTER, DROP, INDEX, CREATE
 VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT` cho DDL. Một tài khoản
@@ -392,7 +439,9 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 CI chạy bộ test trên Ubuntu, Windows và macOS, Python 3.9 và 3.13, và live
 check — mọi đường đọc, mọi đường ghi, một release, một phát hiện lint trong
 một preview thật và một lần ghi dưới lease — với MySQL 8.4, 9.4 và 9.5 trong
-các service container. Nó test với nhánh pythia-core cùng tên khi có.
+các service container; với MariaDB 10.11, 11.4 và 11.8 thì mọi lệnh đọc, một
+vòng `ddl` cho từng object, và việc từ chối mọi lần ghi. Nó test với nhánh
+pythia-core cùng tên khi có.
 
 ## Giấy phép
 

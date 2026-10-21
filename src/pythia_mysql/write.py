@@ -37,7 +37,7 @@ import sys
 
 from pythia_core.output import cell
 
-from .catalog import fold, ident, like_contains, literal, q, sql_of
+from .catalog import MARIADB, fold, ident, like_contains, literal, q, server, sql_of
 from .read import HIDDEN, error_text, refers_to, statements
 
 SAMPLE_ROWS = 10
@@ -558,7 +558,7 @@ def _definition(conn, schema, ident_):
         if otype != ident_["type"]:
             continue
         if body is None:
-            why = (HIDDEN["routine"] if otype in ("PROCEDURE", "FUNCTION") else
+            why = (HIDDEN[server(conn)]["routine"] if otype in ("PROCEDURE", "FUNCTION") else
                    f"SHOW VIEW, TRIGGER or EVENT is needed to read a {otype.lower()}")
             sys.exit(f"Refused: {ident_['name']} exists but this account cannot read "
                      f"its definition ({why}), so there is nothing to snapshot and no "
@@ -569,9 +569,19 @@ def _definition(conn, schema, ident_):
     return None
 
 
+MARIADB_READS_ONLY = ("Refused: pythia-mysql reads MariaDB, and writes to it from its next "
+                      "phase (11b); this version writes to MySQL only. Nothing was written.")
+
+
+def _writes_here(conn):
+    if server(conn) == MARIADB:
+        sys.exit(MARIADB_READS_ONLY)
+
+
 def snapshot(conn, schema, group, ident_):
     """What the statement could replace, as it stands: a view's, routine's,
     trigger's or event's definition, or a table's comment."""
+    _writes_here(conn)
     target_schema = ident_.get("schema") or schema
     if group == "source":
         text = _definition(conn, target_schema, ident_)
@@ -602,6 +612,7 @@ def _settings(conn):
 def rehearse(conn, schema, group, stmt, ident_, snap, errors=Exception):
     """Data runs in the open transaction (core rolls a preview back and
     commits an approved write); everything else is predicted."""
+    _writes_here(conn)
     _settings(conn)
     if group == "session":
         try:
@@ -967,6 +978,7 @@ def _scratch(stmt, ident_):
 def execute(conn, schema, group, stmt, ident_, errors=Exception):
     """Run a predicted statement once. MySQL's DDL is atomic: a statement it
     refuses wrote nothing. A lost connection leaves it unknown."""
+    _writes_here(conn)
     _settings(conn)
     if group == "source" and ident_ and ident_["type"] != "VIEW" and ident_["verb"] == "create":
         old = snapshot(conn, schema, group, ident_).get(ident_["name"])

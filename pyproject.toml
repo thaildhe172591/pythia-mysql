@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pythia-mysql"
-version = "0.1.0"
-description = "pythia for MySQL: stored-program development for AI agents over pythia-core - catalog queries, impact analysis and an approved write path."
+version = "0.2.0.dev0"
+description = "pythia for MySQL and MariaDB: stored-program development for AI agents over pythia-core - catalog queries, impact analysis and an approved write path."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,7 +14,7 @@ requires-python = ">=3.9"
 # pure Python and still runs on 3.9; 1.2 negotiates TLS whenever the server
 # offers it, the "request" default.
 dependencies = ["pythia-core>=0.1.1,<0.2", "PyMySQL>=1.2"]
-keywords = ["mysql", "stored-procedures", "database", "agent-skills"]
+keywords = ["mysql", "mariadb", "stored-procedures", "database", "agent-skills"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -42,4 +42,5 @@ pythia-mysql = "pythia_mysql.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-pythia_mysql = ["queries/*.sql", "skills/*/SKILL.md", "skills/*/reference/*.md"]
+pythia_mysql = ["queries/*.sql", "queries/mariadb/*.sql", "skills/*/SKILL.md",
+                "skills/*/reference/*.md"]

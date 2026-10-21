@@ -47,12 +47,14 @@ rewrote it.
 - **`[text]` rows are leads, not proofs.** MySQL records nothing about what
   a procedure, function, trigger or event body uses; pythia-mysql finds
   names in those bodies and marks them. Say which rows are which.
-- **`-- blind spot:` lines are part of the answer.** MySQL hides routines
-  from an account without `SHOW_ROUTINE`, triggers without `TRIGGER` and
+- **`-- blind spot:` lines are part of the answer.** The server hides
+  routines from an account without `SHOW_ROUTINE` (MariaDB: `SHOW CREATE
+  ROUTINE`, or `SELECT` on `mysql.proc`), triggers without `TRIGGER` and
   events without `EVENT`, and other schemas as far as privileges stop.
   Relay them; "no triggers" is not an answer while one says they are
   hidden.
-- **`errors` lists the views MySQL has marked invalid.** It cannot check a
+- **`errors` lists the views MySQL has marked invalid** (on MariaDB, those
+  CHECK TABLE cannot open, with the cause). It cannot check a
   routine, trigger or event before it runs — MySQL resolves their names
   only then — so it names them as unchecked: a `NOT VERIFIED` line is never
   "no errors".

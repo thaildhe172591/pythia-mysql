@@ -23,41 +23,78 @@ as it was written. A view's SELECT is kept only as MySQL rewrote it.
 what a view reads marks it, and information_schema then shows the error the
 view would raise. Nothing checks a routine, trigger or event before it
 runs, so `errors` names those as unchecked.
+
+MariaDB records no dependencies at all and marks no view invalid. It does
+store each view's SELECT with every name written `schema`.`name`, so a
+view's dependencies are read there (how = "definition"), and `errors` asks
+CHECK TABLE of every view, which opens it and names what it cannot find.
+It hides routines behind its own privileges (SHOW CREATE ROUTINE from 11.3,
+SELECT on mysql.proc before), and keeps sequences and, in sql_mode=ORACLE,
+packages, which are read too.
 """
 import datetime
 import re
 
 from pythia_core.output import TEXT_HOW
 
-from .catalog import fold, ident, like_contains, literal, q
+from .catalog import MARIADB, MYSQL, fold, ident, like_contains, literal, q, run_template, server
 
 CATALOG_HOW = "catalog"
-CODE_TYPES = ("PROCEDURE", "FUNCTION", "TRIGGER", "EVENT")
+# MariaDB's stored view definition names it `schema`.`name`: not a record of
+# the dependency, but not a guess from a body either
+DEFINITION_HOW = "definition"
+ROUTINE_TYPES = ("PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY")
+CODE_TYPES = ROUTINE_TYPES + ("TRIGGER", "EVENT")
 
 DDL_NOTE = ("-- rebuilt from information_schema by pythia-mysql; MySQL's own "
             "SHOW CREATE is the reference")
 
-BLIND_TEXT_IN = (
-    "MySQL records no dependencies for procedures, functions, triggers or "
-    "events, so their bodies are matched by name ([text]): a variable, column "
-    "or comment with the same name gives a false match, and a name built at "
-    "run time (PREPARE of a string) is not seen at all")
-BLIND_TEXT_OUT = (
-    "a procedure, function, trigger or event body is read against the names "
-    "of existing tables, views and routines ([text]): MySQL records none of "
-    "it, and a name built at run time is not seen")
+BLIND_TEXT_IN = {
+    MYSQL: ("MySQL records no dependencies for procedures, functions, triggers "
+            "or events, so their bodies are matched by name ([text]): a "
+            "variable, column or comment with the same name gives a false match, "
+            "and a name built at run time (PREPARE of a string) is not seen at all"),
+    MARIADB: ("MariaDB records no dependencies at all: views are read in their "
+              "stored definitions, where every name is written `schema`.`name` "
+              "(definition), and procedure, function, trigger, event and package "
+              "bodies are matched by name ([text]): a variable, column or comment "
+              "with the same name gives a false match, and a name built at run "
+              "time (PREPARE of a string) is not seen at all"),
+}
+BLIND_TEXT_OUT = {
+    MYSQL: ("a procedure, function, trigger or event body is read against the "
+            "names of existing tables, views and routines ([text]): MySQL "
+            "records none of it, and a name built at run time is not seen"),
+    MARIADB: ("a view is read in its stored definition (definition), and a "
+              "procedure, function, trigger, event or package body against the "
+              "names of existing tables, views and routines ([text]): MariaDB "
+              "records none of it, and a name built at run time is not seen"),
+}
 BLIND_ELSEWHERE = (
     "other schemas are seen only as far as this account's privileges reach "
     "there")
 HIDDEN = {
-    "routine": ("this account holds neither SHOW_ROUTINE nor a global SELECT: "
-                "MySQL hides the procedures and functions it did not define, or "
-                "shows them without a body (GRANT SHOW_ROUTINE ON *.* lets it "
-                "read them)"),
-    "trigger": ("this account holds no TRIGGER privilege on {schema}: MySQL "
-                "hides that schema's triggers from it"),
-    "event": ("this account holds no EVENT privilege on {schema}: MySQL hides "
-              "that schema's events from it"),
+    MYSQL: {
+        "routine": ("this account holds neither SHOW_ROUTINE nor a global SELECT: "
+                    "MySQL hides the procedures and functions it did not define, or "
+                    "shows them without a body (GRANT SHOW_ROUTINE ON *.* lets it "
+                    "read them)"),
+        "trigger": ("this account holds no TRIGGER privilege on {schema}: MySQL "
+                    "hides that schema's triggers from it"),
+        "event": ("this account holds no EVENT privilege on {schema}: MySQL hides "
+                  "that schema's events from it"),
+    },
+    MARIADB: {
+        "routine": ("this account holds neither SHOW CREATE ROUTINE (MariaDB 11.3 and "
+                    "later) nor SELECT on mysql.proc or on every database: MariaDB "
+                    "hides the procedures, functions and packages it did not define "
+                    "(GRANT SHOW CREATE ROUTINE ON *.* lets it read them; on 10.11, "
+                    "GRANT SELECT ON mysql.proc)"),
+        "trigger": ("this account holds no TRIGGER privilege on {schema}: MariaDB "
+                    "hides that schema's triggers from it"),
+        "event": ("this account holds no EVENT privilege on {schema}: MariaDB hides "
+                  "that schema's events from it"),
+    },
 }
 
 
@@ -117,25 +154,40 @@ def db_matches(pattern, schema):
 
 
 def hidden_kinds(conn, schema):
-    """{kind: why} for what MySQL hides from this account in a schema —
+    """{kind: why} for what the server hides from this account in a schema —
     'routine', 'trigger', 'event' — read from SHOW GRANTS; {} when it sees
-    them all. A grant on one table is not a grant on the schema."""
+    them all. A grant on one table is not a grant on the schema. Only the
+    privilege list and the scope of each line are read: MariaDB's lines also
+    carry the password hash, which goes nowhere."""
+    name = server(conn)
     held = {"routine": False, "trigger": False, "event": False}
     for row in q(conn, "grants.sql")[1]:
         m = GRANT_RE.match(str(row[0]).strip())
         if not m:
             continue        # a role granted: once active, its privileges are listed
         privs, where = privileges(m.group(1)), SCOPE_RE.match(m.group(2))
-        if not where or where.group(2) != "*":
+        if not where:
             continue
         db = where.group(1) if where.group(1) == "*" else fold(where.group(1))
+        obj = where.group(2) if where.group(2) == "*" else fold(where.group(2))
         everything = bool(privs & {"ALL", "ALL PRIVILEGES"})
-        if db == "*" and (everything or privs & {"SHOW_ROUTINE", "SELECT"}):
+        reads = everything or "SELECT" in privs
+        if name == MARIADB:
+            # another definer's routine: SHOW CREATE ROUTINE (11.3 and later),
+            # or whoever may read mysql.proc, where MariaDB keeps routines
+            if (db == "*" and (reads or "SHOW CREATE ROUTINE" in privs)) \
+                    or (db.lower() == "mysql" and obj in ("*", "proc") and reads) \
+                    or (obj == "*" and db_matches(db, schema)
+                        and "SHOW CREATE ROUTINE" in privs):
+                held["routine"] = True
+        elif db == "*" and (everything or privs & {"SHOW_ROUTINE", "SELECT"}):
             held["routine"] = True
+        if obj != "*":
+            continue
         if db_matches(db, schema):
             held["trigger"] = held["trigger"] or everything or "TRIGGER" in privs
             held["event"] = held["event"] or everything or "EVENT" in privs
-    return {kind: HIDDEN[kind].format(schema=schema)
+    return {kind: HIDDEN[name][kind].format(schema=schema)
             for kind, seen in held.items() if not seen}
 
 
@@ -155,6 +207,12 @@ def timestamp(value):
 def routine_header(schema, row, params):
     (rtype, name, returns, rcharset, determ, access, security, comment, who,
      _mode, language, _body, schema_charset) = row
+    if rtype in ("PACKAGE", "PACKAGE BODY"):
+        # MariaDB's, in sql_mode=ORACLE: its body is the text from AS on
+        head = f"CREATE {definer(who)} {rtype} {ident(schema)}.{ident(name)}"
+        if security == "INVOKER":
+            head += " SQL SECURITY INVOKER"
+        return head + (f" COMMENT {literal(comment)}" if comment else "")
     args = []
     for _rt, _pos, mode, pname, dtype, charset in params:
         arg = f"{ident(pname)} {dtype}"
@@ -248,7 +306,7 @@ def statements(conn, schema, name):
             for row in q(conn, "view.sql", s=schema, n=obj)[1]:
                 head, body = view_statement(schema, row)
                 out.append((otype, obj, head, body, []))
-        elif otype in ("PROCEDURE", "FUNCTION"):
+        elif otype in ROUTINE_TYPES:
             if routines is None:
                 params = q(conn, "routine-params.sql", s=schema, n=obj)[1]
                 routines = [(r, [p for p in params if p[0] == r[0]])
@@ -307,7 +365,10 @@ def default_sql(default, extra, ctype):
     return literal(default)
 
 
-def column_line(row, table_charset, table_collation):
+def column_line(row, table_charset, table_collation, mariadb=False, check=None):
+    """A column as SHOW CREATE TABLE prints it. MariaDB keeps the default as
+    SQL already and its expressions unescaped; check is a column-level CHECK
+    clause, which MariaDB prints on the column."""
     name, ctype, nullable, default, extra, gen, charset, collation, comment, srs = row
     extra = extra or ""
     parts = [ident(name), ctype]
@@ -317,14 +378,14 @@ def column_line(row, table_charset, table_collation):
         parts.append(f"COLLATE {collation}")
     if gen:
         kind = "STORED" if "STORED" in extra.upper() else "VIRTUAL"
-        parts.append(f"GENERATED ALWAYS AS ({unescaped(gen)}) {kind}")
+        parts.append(f"GENERATED ALWAYS AS ({gen if mariadb else unescaped(gen)}) {kind}")
     if nullable == "NO":
         parts.append("NOT NULL")
     if srs is not None:
         parts.append(f"SRID {srs}")
     if not gen:
-        if default is not None:
-            parts.append("DEFAULT " + default_sql(default, extra, ctype))
+        if default is not None and not (mariadb and default == "NULL"):
+            parts.append("DEFAULT " + (default if mariadb else default_sql(default, extra, ctype)))
         elif nullable == "YES":
             parts.append("DEFAULT NULL")
     if "INVISIBLE" in extra.upper():
@@ -336,10 +397,12 @@ def column_line(row, table_charset, table_collation):
         parts.append(f"ON UPDATE {on_update.group(1)}")
     if comment:
         parts.append(f"COMMENT {literal(comment)}")
+    if check:
+        parts.append(f"CHECK ({check})")
     return " ".join(parts)
 
 
-def index_lines(rows):
+def index_lines(rows, mariadb=False):
     indexes = {}
     for name, non_unique, _seq, col, sub, direction, itype, expr, visible, comment in rows:
         ix = indexes.setdefault(name, {"unique": not non_unique, "type": itype,
@@ -370,7 +433,7 @@ def index_lines(rows):
         if ix["comment"]:
             text += f" COMMENT {literal(ix['comment'])}"
         if ix["visible"] == "NO":
-            text += " INVISIBLE"
+            text += " IGNORED" if mariadb else " INVISIBLE"
         lines.append(text)
     return lines
 
@@ -426,21 +489,28 @@ def table_ddl(conn, schema, name):
     head = q(conn, "table-head.sql", s=schema, n=name)[1]
     if not head:
         return ""
-    engine, charset, collation, options, comment, partitioned = head[0]
-    body = [column_line(r, charset, collation)
+    engine, charset, collation, options, comment, partitioned, versioned = head[0]
+    mariadb = server(conn) == MARIADB
+    checks = sorted(q(conn, "table-checks.sql", s=schema, n=name)[1])
+    # MariaDB keeps a column's own CHECK under the column's name, and prints
+    # it on the column; its clauses carry no extra escaping
+    on_column = {c[0]: c[1] for c in checks if c[3] == "Column"}
+    body = [column_line(r, charset, collation, mariadb, on_column.get(r[0]))
             for r in q(conn, "table-columns.sql", s=schema, n=name)[1]]
-    body += index_lines(q(conn, "table-indexes.sql", s=schema, n=name)[1])
+    body += index_lines(q(conn, "table-indexes.sql", s=schema, n=name)[1], mariadb)
     body += foreign_key_lines(q(conn, "table-foreign-keys.sql", s=schema, n=name)[1])
-    body += [f"CONSTRAINT {ident(cname)} CHECK ({unescaped(clause)})"
+    body += [f"CONSTRAINT {ident(cname)} CHECK ({clause if mariadb else unescaped(clause)})"
              + (" NOT ENFORCED" if enforced == "NO" else "")
-             for cname, clause, enforced in sorted(
-                 q(conn, "table-checks.sql", s=schema, n=name)[1])]
+             for cname, clause, enforced, level in checks if level != "Column"]
     notes = []
     if partitioned:
         notes.append("-- partitioned: the PARTITION BY clause is not rebuilt")
-    if "trigger" in hidden_kinds(conn, schema):
-        notes.append(f"-- triggers: {HIDDEN['trigger'].format(schema=schema)}, so none "
-                     "are listed here")
+    if versioned:
+        notes.append("-- system-versioned: WITH SYSTEM VERSIONING and its period columns "
+                     "are not rebuilt")
+    hidden = hidden_kinds(conn, schema)
+    if "trigger" in hidden:
+        notes.append(f"-- triggers: {hidden['trigger']}, so none are listed here")
     text = "\n".join(notes + [
         f"CREATE TABLE {ident(schema)}.{ident(name)} (\n"
         + ",\n".join("  " + line for line in body) + "\n) "
@@ -453,22 +523,51 @@ def table_ddl(conn, schema, name):
     return text
 
 
+SEQUENCE_NOTE = ("-- printed by MariaDB's SHOW CREATE SEQUENCE: a copy starts again at "
+                 "its START WITH, not where this sequence has reached")
+
+
+def sequence_ddl(conn, schema, name):
+    """A MariaDB sequence as the server prints it, its name qualified: 10.11
+    keeps no catalog table for sequences."""
+    rows = run_template(conn, "show-create-sequence.sql",
+                        sequence=f"{ident(schema)}.{ident(name)}")[1]
+    if not rows:
+        return ""
+    text = re.sub(r"^CREATE SEQUENCE\s+`(?:[^`]|``)+`",
+                  lambda m: f"CREATE SEQUENCE {ident(schema)}.{ident(name)}",
+                  str(rows[0][1]), count=1)
+    return f"{SEQUENCE_NOTE}\n{text};"
+
+
 def ddl(conn, schema, name):
     objs = resolve(conn, schema, fold(name))
     if not objs:
         return ""
     if objs[0][2] == "TABLE":
         return DDL_NOTE + "\n" + table_ddl(conn, schema, objs[0][1])
+    if objs[0][2] == "SEQUENCE":
+        return sequence_ddl(conn, schema, objs[0][1])
     parts = [DDL_NOTE]
+    routine_privilege = ("SHOW CREATE ROUTINE (or SELECT on mysql.proc)"
+                         if server(conn) == MARIADB else "SHOW_ROUTINE (or a global SELECT)")
     for otype, obj, head, body, notes in statements(conn, schema, name):
         if body is None:
             parts.append(f"-- {otype} {obj}: no definition is readable — this account "
                          "neither defined it nor holds "
                          + ("SHOW VIEW on it" if otype == "VIEW" else
-                            "SHOW_ROUTINE (or a global SELECT)" if otype in
-                            ("PROCEDURE", "FUNCTION") else f"the {otype} privilege"))
+                            routine_privilege if otype in ROUTINE_TYPES
+                            else f"the {otype} privilege"))
         elif otype == "VIEW":
             parts.append(f"{head}\n{body};")
+        elif otype in ("PACKAGE", "PACKAGE BODY"):
+            # Oracle syntax: it parses only in the mode it was created in
+            mode = q(conn, "routine.sql", s=schema, n=obj)[1]
+            mode = next((r[9] for r in mode if r[0] == otype), "")
+            parts.append("SET @pythia_sql_mode = @@sql_mode;\n"
+                         f"SET SESSION sql_mode = {literal(mode)};\n"
+                         + delimited([(notes, head, body)])
+                         + "\nSET SESSION sql_mode = @pythia_sql_mode;")
         else:
             parts.append(delimited([(notes, head, body)]))
     return "\n".join(parts)
@@ -531,7 +630,7 @@ def walk(roots, depth, children):
 
 
 def bodies(conn, schema, name, otype):
-    if otype in ("PROCEDURE", "FUNCTION"):
+    if otype in ROUTINE_TYPES:
         rows = [r[11] for r in q(conn, "routine.sql", s=schema, n=name)[1] if r[0] == otype]
     elif otype == "TRIGGER":
         rows = [r[5] for r in q(conn, "triggers.sql", s=schema, n=name, t=None)[1]]
@@ -544,21 +643,29 @@ def dependents(conn, schema, name, depth):
     roots = resolve(conn, schema, fold(name))
     if not roots:
         return None
+    mariadb = server(conn) == MARIADB
 
     def children(node):
         node_schema, node_name, node_type = node
         found = sorted({tuple(r) for r in q(conn, "dependents-catalog.sql", s=node_schema,
                                             n=node_name, t=node_type)[1]})
         out = [r + (CATALOG_HOW,) for r in found]
+        seen = set(found) | {node}
+        if mariadb and node_type in ("TABLE", "VIEW", "FUNCTION", "SEQUENCE"):
+            views = sorted({tuple(r) for r in q(conn, "view-dependents.sql", s=node_schema,
+                                                n=node_name)[1]} - seen)
+            out += [r + (DEFINITION_HOW,) for r in views]
+            seen |= set(views)
         if node_type in ("TRIGGER", "EVENT"):
             return out                          # no code names one to call it
-        seen, leads = set(found) | {node}, set()
+        leads = set()
         for s, n, t, body in q(conn, "dependents-text.sql", p=like_contains(node_name))[1]:
             if (s, n, t) not in seen and refers_to(body, node_name, s, node_schema):
                 leads.add((s, n, t))
         return out + [r + (TEXT_HOW,) for r in sorted(leads)]
 
-    blind = [BLIND_TEXT_IN, BLIND_ELSEWHERE] + list(hidden_kinds(conn, schema).values())
+    blind = [BLIND_TEXT_IN[server(conn)], BLIND_ELSEWHERE] + list(
+        hidden_kinds(conn, schema).values())
     return walk(roots, depth, children), blind
 
 
@@ -567,21 +674,29 @@ def dependencies(conn, schema, name, depth):
     if not roots:
         return None
 
+    mariadb = server(conn) == MARIADB
+
     def children(node):
         node_schema, node_name, node_type = node
         found = sorted({tuple(r) for r in q(conn, "dependencies-catalog.sql", s=node_schema,
                                             n=node_name, t=node_type)[1]})
         out = [r + (CATALOG_HOW,) for r in found]
+        seen = set(found) | {node}
+        if mariadb and node_type == "VIEW":
+            named = sorted({tuple(r) for r in q(conn, "view-dependencies.sql", s=node_schema,
+                                                n=node_name)[1]} - seen)
+            out += [r + (DEFINITION_HOW,) for r in named]
         if node_type not in CODE_TYPES:
             return out
-        seen, leads = set(found) | {node}, set()
+        leads = set()
         for body in bodies(conn, node_schema, node_name, node_type):
             for s, n, t in q(conn, "dependencies-text.sql", b=body)[1]:
                 if (s, n, t) not in seen and refers_to(body, n, node_schema, s):
                     leads.add((s, n, t))
         return out + [r + (TEXT_HOW,) for r in sorted(leads)]
 
-    blind = [BLIND_TEXT_OUT, BLIND_ELSEWHERE] + list(hidden_kinds(conn, schema).values())
+    blind = [BLIND_TEXT_OUT[server(conn)], BLIND_ELSEWHERE] + list(
+        hidden_kinds(conn, schema).values())
     return walk(roots, depth, children), blind
 
 
@@ -596,9 +711,32 @@ def error_text(exc):
     return number, (first[0] if first else str(exc)).strip()
 
 
+CHECKED_AT_ONCE = 100
+
+
+def checked_views(conn, schema, views):
+    """[(view, message)] for the views MariaDB cannot open, from CHECK TABLE:
+    each one's first error, which names the cause (a table or column that is
+    gone) before the view's own complaint."""
+    broken = {}
+    for i in range(0, len(views), CHECKED_AT_ONCE):
+        chunk = views[i:i + CHECKED_AT_ONCE]
+        named = {f"{schema}.{v}": v for v in chunk}
+        listed = ", ".join(f"{ident(schema)}.{ident(v)}" for v in chunk)
+        for table, _op, kind, text in run_template(conn, "check-views.sql", views=listed)[1]:
+            view = named.get(str(table))
+            if view and str(kind).lower() == "error" and str(text) != "Corrupt":
+                broken.setdefault(view, str(text))
+    return sorted(broken.items())
+
+
 def view_findings(conn, schema, name):
-    return [(n, "VIEW", None, None, "error", message)
-            for n, message in q(conn, "view-errors.sql", s=schema, n=name)[1]]
+    if server(conn) == MARIADB:
+        views = [r[0] for r in q(conn, "views.sql", s=schema, n=name)[1]]
+        found = checked_views(conn, schema, views)
+    else:
+        found = q(conn, "view-errors.sql", s=schema, n=name)[1]
+    return [(n, "VIEW", None, None, "error", message) for n, message in found]
 
 
 UNCHECKED_SHOWN = 10
@@ -612,10 +750,11 @@ def compile_errors(conn, schema, name):
         types = {t for _s, _n, t in objs}
         if "VIEW" in types:
             return view_findings(conn, schema, fold(name)), None
-        if "TABLE" in types:
-            return [], f"{name} is a table: MySQL keeps no code in it to check"
-        return [], (f"MySQL resolves the names inside {name} only when it runs: "
-                    "nothing in it was checked")
+        if types & {"TABLE", "SEQUENCE"}:
+            kind = "table" if "TABLE" in types else "sequence"
+            return [], f"{name} is a {kind}: {server(conn)} keeps no code in it to check"
+        return [], (f"{server(conn)} resolves the names inside {name} only when it "
+                    "runs: nothing in it was checked")
     rows = view_findings(conn, schema, None)
     notes = []
     code = q(conn, "unchecked.sql", s=schema)[1]
@@ -623,8 +762,9 @@ def compile_errors(conn, schema, name):
         shown = ", ".join(n for n, _t in code[:UNCHECKED_SHOWN])
         if len(code) > UNCHECKED_SHOWN:
             shown += f" and {len(code) - UNCHECKED_SHOWN} more"
-        notes.append("MySQL resolves the names inside procedures, functions, "
-                     f"triggers and events only when they run: {len(code)} were not "
-                     f"checked ({shown})")
+        kinds = ("procedures, functions, packages, triggers and events"
+                 if server(conn) == MARIADB else "procedures, functions, triggers and events")
+        notes.append(f"{server(conn)} resolves the names inside {kinds} only when they "
+                     f"run: {len(code)} were not checked ({shown})")
     notes.extend(hidden_kinds(conn, schema).values())
     return rows, "; ".join(notes) if notes else None
