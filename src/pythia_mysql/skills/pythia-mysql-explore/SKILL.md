@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-explore
-description: Use when explaining, investigating or reading MySQL objects - what a procedure does, where a table is used, why something fails, what a schema holds. Asks the live database through pythia-mysql read commands, never a dump, Workbench scripts or memory.
+description: Use when explaining, investigating or reading MySQL or MariaDB objects - what a procedure does, where a table is used, why something fails, what a schema holds. Asks the live database through pythia-mysql read commands, never a dump, Workbench scripts or memory.
 ---
 
 # Explore the live database

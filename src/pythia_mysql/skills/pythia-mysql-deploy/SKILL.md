@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-deploy
-description: Use when landing several MySQL data changes together - a backfill, a data fix across tables, inserts, updates and deletes that must land all or none, or more than one file of them. pythia-mysql deploy rehearses the whole release in one transaction and lands all of it or none of it, under one approval.
+description: Use when landing several MySQL or MariaDB data changes together - a backfill, a data fix across tables, inserts, updates and deletes that must land all or none, or more than one file of them. pythia-mysql deploy rehearses the whole release in one transaction and lands all of it or none of it, under one approval.
 ---
 
 # Deploy data changes as one transaction
@@ -51,7 +51,7 @@ A RELEASE LANDS WHOLE, AS APPROVED, OR NOT AT ALL
 ## What a release cannot hold
 
 DDL — a table, a column, an index, a view, a routine, a trigger, an event, a
-grant: MySQL commits each as it runs it, so it is predicted, not rehearsed,
+grant: the server commits each as it runs it, so it is predicted, not rehearsed,
 and a release that lands all or nothing cannot hold it. `deploy` refuses
 the release and rolls everything back — apply each DDL statement on its own,
 in order, before or after the data. A trigger that writes to a MyISAM table

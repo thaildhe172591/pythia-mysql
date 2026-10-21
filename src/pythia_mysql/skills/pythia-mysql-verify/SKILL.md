@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-verify
-description: Use before claiming any MySQL change is done, fixed, working or safe - after an apply, a deploy, a restore, or a fix to a broken view or procedure. Evidence first - exit codes, errors, the dependents - and "broken", "not verified" or "WRITTEN?" said plainly.
+description: Use before claiming any MySQL or MariaDB change is done, fixed, working or safe - after an apply, a deploy, a restore, or a fix to a broken view or procedure. Evidence first - exit codes, errors, the dependents - and "broken", "not verified" or "WRITTEN?" said plainly.
 ---
 
 # Evidence before "done"

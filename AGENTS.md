@@ -1,13 +1,13 @@
 # Working in this repository / with this tool
 
 pythia-mysql is pythia for MySQL and MariaDB, on pythia-core. It is alpha
-(0.1.0): it reads everything pythia's Learn movement needs, and writes
+(0.2.0): it reads everything pythia's Learn movement needs, and writes
 through one gate — data rehearsed in a transaction, DDL predicted, written
 once and read back. `pythia-mysql install` wires a project: the guard, the
 session brief and the `pythia-mysql-*` skills (`using-pythia-mysql`
-routes). MariaDB (Phase 11a) is read; writes to it are refused until 11b.
+routes).
 
-## Using pythia-mysql as an agent (Phase 9c)
+## Using pythia-mysql as an agent (Phase 11)
 
 1. **Ask the database, never the dump.** `ls`, `src`, `cols`, `ddl`, `grep`
    against the live schema; `check` says where unqualified names land (the
@@ -49,8 +49,9 @@ routes). MariaDB (Phase 11a) is read; writes to it are refused until 11b.
    <token>` only after the approval arrives. `--yes` and loosening `policy`
    are the developer's actions, at a console.
 7. **"Predicted — nothing ran" is a prediction, and is said as one.** MySQL
-   commits DDL as it runs it: the preview predicts what would break, and
-   the write is read back after. Never call a prediction a rehearsal, and
+   and MariaDB commit DDL as they run it: the preview predicts what would
+   break, and the write is read back after (on MariaDB, the views reading
+   what it touched are opened again). Never call a prediction a rehearsal, and
    never call an approved write "verified" before its report.
 8. **Autopilot is the developer's delegation, not yours.** When they want
    you to work without per-write approvals, request the narrowest lease
@@ -139,6 +140,10 @@ routes). MariaDB (Phase 11a) is read; writes to it are refused until 11b.
   `.pythia/mssql/`, `.pythia/mongo/`), or take their commands or variables.
 - Point the live check at a shared server: it creates an account, drops
   databases and writes through every path.
+- Run a statement that commits implicitly — `CHECK TABLE`, `ANALYZE`, any
+  DDL — inside a rehearsal or a prediction: the rows a release has
+  rehearsed would land with it. On MariaDB a view is opened with `SELECT
+  ... LIMIT 0` there; `CHECK TABLE` belongs to `errors`' read session.
 - Field-test `pythia-mysql install` inside this repository:
   `src/pythia_mysql/skills/` is the source pack. Use a scratch directory.
 - Put real-world identifiers anywhere (hosts, schemas, tenants,

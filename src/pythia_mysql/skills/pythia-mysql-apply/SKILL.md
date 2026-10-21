@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-apply
-description: Use when landing any change in MySQL - creating or replacing a view, procedure, function, trigger or event, a table comment, DDL, a GRANT/REVOKE, an INSERT/UPDATE/DELETE, or restoring a previous version. Every write goes through pythia-mysql apply - one statement, rehearsed or predicted, previewed, approved by the developer, then written.
+description: Use when landing any change in MySQL or MariaDB - creating or replacing a view, procedure, function, trigger or event, a table comment, DDL, a GRANT/REVOKE, an INSERT/UPDATE/DELETE, or restoring a previous version. Every write goes through pythia-mysql apply - one statement, rehearsed or predicted, previewed, approved by the developer, then written.
 ---
 
 # Apply through the gate
@@ -9,7 +9,7 @@ description: Use when landing any change in MySQL - creating or replacing a view
 
 **Phase:** Ask → Do — the preview is the Ask, the confirm is the Do
 
-MySQL commits DDL as it runs it, so the gate works two ways. A data change
+MySQL and MariaDB commit DDL as they run it, so the gate works two ways. A data change
 is **rehearsed**: run inside a transaction and rolled back. DDL is
 **predicted**: nothing runs before the approval; the preview says what
 would break, and after the write the result is read back. The mysql
@@ -40,9 +40,11 @@ NO WRITE WITHOUT A PREVIEW THE DEVELOPER SAW AND APPROVED
      from information_schema);
    - **rehearsed** (data): the rows it touched, with a sample, rolled back;
    - **predicted — nothing ran** (DDL): what it **would break** (the views
-     MySQL would mark invalid), or `NOT VERIFIED` with the reason;
+     MySQL would mark invalid; on MariaDB, the views that would no longer
+     open), or `NOT VERIFIED` with the reason;
    - notes: a CREATE that replaces an existing routine (MySQL has no CREATE
-     OR REPLACE for one), a definer that changes, `! DESTRUCTIVE`;
+     OR REPLACE for one; MariaDB replaces it in one step), a definer that
+     changes, `! DESTRUCTIVE`;
    - a token, and the approval doors.
 4. **Relay the preview verbatim** — diff, rehearsal or prediction, rows,
    notes. Do not summarise away a broken dependent, a definer note or a NOT
@@ -99,8 +101,8 @@ a console — never yours.
 through the same approval and `--confirm <token>`. Only definitions and
 table comments have a restore: rows, a dropped column or a revoked grant do
 not come back. Putting back another account's routine or view needs
-`SET_ANY_DEFINER`; without it the restore is refused with nothing written,
-and the developer or a DBA runs it.
+`SET_ANY_DEFINER` (MariaDB: `SET USER`); without it the restore is refused
+with nothing written, and the developer or a DBA runs it.
 
 ## Red Flags — STOP if you catch yourself thinking
 
@@ -111,5 +113,5 @@ and the developer or a DBA runs it.
 | "Predicted fine, so it is verified" | A prediction is not a result. Wait for the write's report. |
 | "Exit 3, but it mostly worked" | Exit 3 is broken. Say so first. |
 | "WRITTEN? — it was only a preview" | A trigger may have written a MyISAM table. Stop and show the developer. |
-| "I'll DROP the procedure first, then CREATE it" | Apply the CREATE: pythia-mysql replaces it, and puts the old one back if MySQL refuses. |
+| "I'll DROP the procedure first, then CREATE it" | Apply the CREATE: pythia-mysql replaces it, and the old one stays if the server refuses the new. |
 | "The preview is long, I'll summarise" | The developer approves what they saw. Relay it. |

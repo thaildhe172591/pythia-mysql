@@ -9,7 +9,7 @@ Oracle và các engine anh em làm trên PostgreSQL, SQL Server và MongoDB:
 agent học từ catalog đang chạy, hỏi một người trước mọi lần ghi, và chỉ ghi
 qua một cổng có snapshot, có kiểm chứng và báo cáo trung thực.
 
-**Alpha (0.1.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
+**Alpha (0.2.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
 một cổng duy nhất — dữ liệu được diễn tập trong transaction, DDL được dự
 đoán, ghi một lần rồi đọc lại — và chuẩn bị một project cho agent: guard,
 bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-mysql-*`.
@@ -20,14 +20,13 @@ bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-
 | ghi: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
-**MariaDB (Phase 11a, trên main, chưa lên PyPI):** mọi lệnh đọc, đọc từ
-catalog riêng của MariaDB. Mọi lần ghi vào MariaDB bị từ chối trước khi chạy
-gì cho tới Phase 11b.
+MariaDB được đọc và ghi bằng cùng các lệnh, từ catalog riêng của nó; ở
+những chỗ nó khác, các mục MariaDB bên dưới nói rõ cách làm.
 
 MySQL 8.4 LTS là phiên bản tối thiểu: CI chạy toàn bộ live check trên 8.4,
-9.4 và 9.5. Với MariaDB, tối thiểu là 10.11 LTS: CI chạy các lệnh đọc trên
-10.11, 11.4 và 11.8. Thấp hơn một trong hai mức đó thì `check` nói rõ (không
-gì bị từ chối).
+9.4 và 9.5. Với MariaDB, tối thiểu là 10.11 LTS: CI chạy toàn bộ live check
+trên 10.11, 11.4 và 11.8. Thấp hơn một trong hai mức đó thì `check` nói rõ
+(không gì bị từ chối).
 
 ## Cài đặt
 
@@ -209,8 +208,6 @@ tên server đã kết nối tới.
   được dựng lại trên cột của nó, một index bị bỏ qua thành `IGNORED`, và
   `ddl` của một table system-versioned nói rằng phần versioning không được
   dựng lại.
-- **Ghi chờ Phase 11b.** `apply` và `deploy` vào MariaDB bị từ chối trước
-  khi chạy gì, không có gì được ghi.
 
 ### Ghi: cổng
 
@@ -389,6 +386,34 @@ MySQL commit DDL ngay khi chạy, nên đường ghi tách làm hai:
   mệnh đề `PARTITION`, ngoặc không cân); và một routine mà tài khoản này
   không đọc được thân (không có gì để snapshot).
 
+### MariaDB: đường ghi làm khác ở đâu
+
+Cổng vẫn là một — dữ liệu được rehearse, DDL được dự đoán — và ở chỗ
+MariaDB khác, cổng cũng làm khác:
+
+- **Dự đoán mở các view, trước và sau.** MariaDB không đánh dấu view nào là
+  hỏng, nên các view đọc thứ mà câu lệnh chạm tới — tìm trong định nghĩa của
+  chúng, theo bắc cầu — được mở từng cái bằng `SELECT ... LIMIT 0` trước
+  preview và lại sau khi ghi; những view không còn mở được là thứ đã gãy, và
+  mọi điều khác với dự đoán đều thoát với mã 3. Một view đọc view khác ghi
+  cột của nó là `` `view`.`column` ``, không có schema, và dự đoán đọc chúng
+  đúng như vậy. `CHECK TABLE` không bao giờ chạy ở đó: nó commit transaction
+  nó chạy trong, và các dòng mà một release đã rehearse sẽ bị ghi theo.
+- **Một routine được thay trong một bước.** MariaDB có `CREATE OR REPLACE`
+  cho procedure, function, trigger và event, và giữ bản cũ khi từ chối bản
+  mới: một `CREATE` cho object đã có chạy thành `CREATE OR REPLACE`, không
+  cần bản nháp và không có lúc nào thiếu trigger. MySQL không có câu lệnh
+  này, và `CREATE OR REPLACE PROCEDURE` ở đó bị từ chối kèm hướng đi tiếp.
+- **Definer khác cần `SET USER`** (hoặc `SUPER`); preview nói khi tài khoản
+  này không thể trả lại definer cũ, và nêu tên một tài khoản có `SET USER`
+  là tài khoản có thể hành động như bất kỳ tài khoản nào.
+- **Sequence được ghi** (`CREATE`, `ALTER`, `DROP SEQUENCE`), như DDL: được
+  dự đoán, và một `DROP` làm gãy các view lấy giá trị từ sequence đó.
+  `CREATE OR REPLACE TABLE` và `CREATE OR REPLACE SEQUENCE` mang tính phá
+  huỷ: chúng xoá cái cũ trước.
+- **Bị từ chối, kèm lý do:** một package (chỉ đọc), `RETURNING`, `DELETE
+  HISTORY`.
+
 pythia-mysql không bao giờ bật `MULTI_STATEMENTS` hay `LOCAL INFILE`: chính
 MySQL từ chối mọi text nằm sau câu lệnh duy nhất được gửi đi. Một lần ghi
 chờ khoá tối đa 5 giây (`innodb_lock_wait_timeout`, `lock_wait_timeout`).
@@ -424,9 +449,9 @@ GRANT SELECT ON mysql.proc TO 'app_agent'@'%';         -- MariaDB 10.11
 Một lần ghi cần đúng những gì thay đổi đó cần, chỉ trên schema của nó — ví
 dụ `INSERT, UPDATE, DELETE` cho dữ liệu, `CREATE, ALTER, DROP, INDEX, CREATE
 VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT` cho DDL. Một tài khoản
-có mọi quyền trên server, `SUPER`, `SYSTEM_USER`, `SET_ANY_DEFINER` hay
-`SET_USER_ID` được nêu tên trong preview: nhiều hơn hẳn những gì một thay
-đổi cần. Live check chạy mọi đường ghi bằng một tài khoản mà quyền ghi chỉ
+có mọi quyền trên server, `SUPER`, `SYSTEM_USER`, `SET_ANY_DEFINER`,
+`SET_USER_ID` hay `SET USER` của MariaDB được nêu tên trong preview: nhiều
+hơn hẳn những gì một thay đổi cần. Live check chạy mọi đường ghi bằng một tài khoản mà quyền ghi chỉ
 dừng ở schema của nó.
 
 ## Kiểm thử
@@ -439,8 +464,8 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 CI chạy bộ test trên Ubuntu, Windows và macOS, Python 3.9 và 3.13, và live
 check — mọi đường đọc, mọi đường ghi, một release, một phát hiện lint trong
 một preview thật và một lần ghi dưới lease — với MySQL 8.4, 9.4 và 9.5 trong
-các service container; với MariaDB 10.11, 11.4 và 11.8 thì mọi lệnh đọc, một
-vòng `ddl` cho từng object, và việc từ chối mọi lần ghi. Nó test với nhánh
+các service container, và với MariaDB 10.11, 11.4 và 11.8 — thêm một
+sequence, một package và các đường ghi riêng của MariaDB. Nó test với nhánh
 pythia-core cùng tên khi có.
 
 ## Giấy phép

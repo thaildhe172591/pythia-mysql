@@ -1,10 +1,37 @@
 # Changelog
 
-## 0.2.0.dev0 — unreleased
+## 0.2.0 — 2026-10-21
+
+MariaDB, read and written: pythia-mysql works on MariaDB 10.11 and later
+through the same commands, and still asks for pythia-core 0.1.1.
+
+### Phase 11b: MariaDB, written
+
+- **DDL is predicted, then the views are opened.** MariaDB marks no view
+  invalid: the views reading what a statement touches — found in their
+  definitions, transitively — are each opened with `SELECT ... LIMIT 0`
+  before the preview and after the write, and what stopped opening is what
+  broke; anything unlike the prediction exits 3. A view of a view names its
+  columns `` `view`.`column` ``, and the prediction reads them so.
+- **Never `CHECK TABLE` in a write path.** It commits the transaction it
+  runs in: the live check caught a release whose rehearsed INSERT landed
+  when the DDL after it was refused, and a test now refuses any `CHECK
+  TABLE` in a write. `errors` keeps it, in its read-only session.
+- **A routine, trigger or event replaced in one step**: a `CREATE` for one
+  that exists runs as MariaDB's `CREATE OR REPLACE`, which keeps the old one
+  when it refuses the new — no scratch copy, no moment without a trigger.
+  On MySQL, `CREATE OR REPLACE PROCEDURE` (or `FUNCTION`, `TRIGGER`,
+  `EVENT`) is refused with the way forward.
+- **`SET USER`** (or `SUPER`) is what another definer needs on MariaDB: the
+  preview, the restore and the privilege warning say so.
+- **Sequences written** as DDL: predicted, a `DROP` breaking the views that
+  draw from it. `CREATE OR REPLACE TABLE` and `... SEQUENCE` are
+  destructive. On MySQL, a sequence statement is refused.
+- **Refused:** a MariaDB package (read only), `RETURNING`, `DELETE HISTORY`.
+- Every message names the server it reached; the live check runs every
+  write path on MariaDB 10.11, 11.4 and 11.8 too.
 
 ### Phase 11a: MariaDB, read
-
-pythia-mysql reads MariaDB 10.11 and later through the same commands.
 
 - **The server is known on connecting**, by the version MariaDB sends;
   `check` names it, and so does every message core prints. MariaDB's floor
@@ -23,7 +50,6 @@ pythia-mysql reads MariaDB 10.11 and later through the same commands.
   SEQUENCE`, qualified; a package and its body are two units, and their
   `ddl` sets the `sql_mode=ORACLE` they need. A column-level `CHECK` and an
   `IGNORED` index are rebuilt as MariaDB prints them.
-- **Writes to MariaDB are refused** before anything runs, until Phase 11b.
 - `table-head.sql` and `table-checks.sql` gain a column each (`versioned`,
   `level`), shared with MariaDB's; `ls` and the walks know `SEQUENCE`.
 - The live check runs on MariaDB 10.11, 11.4 and 11.8 too

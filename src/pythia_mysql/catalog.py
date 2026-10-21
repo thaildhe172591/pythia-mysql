@@ -69,20 +69,25 @@ QUERY_BINDS = {
 }
 
 MARIADB_QUERY_BINDS = {
-    # in MySQL's place: no view usage tables, no SRS id, ignored indexes,
-    # column-level checks, system-versioned tables
+    # in MySQL's place: no view usage tables (views are read in their
+    # definitions), no SRS id, ignored indexes, column-level checks,
+    # system-versioned tables
     "dependents-catalog.sql": {"s", "n", "t"},
     "dependencies-catalog.sql": {"s", "n", "t"},
     "table-head.sql": {"s", "n"},
     "table-columns.sql": {"s", "n"},
     "table-indexes.sql": {"s", "n"},
     "table-checks.sql": {"s", "n"},
+    "table-engine.sql": {"s", "n"},
+    "views-reading.sql": {"s", "n"},
+    "views-using-function.sql": {"s", "n"},
     # MariaDB's alone: views read in their stored definitions, checked by
-    # CHECK TABLE, and sequences shown as the server prints them
-    "view-dependents.sql": {"s", "n"},
+    # CHECK TABLE (errors) or opened with LIMIT 0 (a write), and sequences
+    # shown as the server prints them
     "view-dependencies.sql": {"s", "n"},
     "views.sql": {"s", "n"},
     "check-views.sql": set(),
+    "view-probe.sql": set(),
     "show-create-sequence.sql": set(),
 }
 

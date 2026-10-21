@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-impact
-description: Use before proposing or writing any change to a MySQL object - a procedure, function, trigger, event, view, table or column. Impact analysis comes first, because what depends on an object decides how careful the change must be.
+description: Use before proposing or writing any change to a MySQL or MariaDB object - a procedure, function, trigger, event, view, table or column. Impact analysis comes first, because what depends on an object decides how careful the change must be.
 ---
 
 # Impact Before Change

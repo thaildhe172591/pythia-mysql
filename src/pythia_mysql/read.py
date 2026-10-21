@@ -652,8 +652,8 @@ def dependents(conn, schema, name, depth):
         out = [r + (CATALOG_HOW,) for r in found]
         seen = set(found) | {node}
         if mariadb and node_type in ("TABLE", "VIEW", "FUNCTION", "SEQUENCE"):
-            views = sorted({tuple(r) for r in q(conn, "view-dependents.sql", s=node_schema,
-                                                n=node_name)[1]} - seen)
+            views = sorted({(vs, vn, "VIEW") for vs, vn in q(
+                conn, "views-reading.sql", s=node_schema, n=node_name)[1]} - seen)
             out += [r + (DEFINITION_HOW,) for r in views]
             seen |= set(views)
         if node_type in ("TRIGGER", "EVENT"):
@@ -714,15 +714,15 @@ def error_text(exc):
 CHECKED_AT_ONCE = 100
 
 
-def checked_views(conn, schema, views):
-    """[(view, message)] for the views MariaDB cannot open, from CHECK TABLE:
-    each one's first error, which names the cause (a table or column that is
-    gone) before the view's own complaint."""
-    broken = {}
+def checked_views(conn, views):
+    """[((schema, view), message)] for the views MariaDB cannot open, from
+    CHECK TABLE: each one's first error, which names the cause (a table or
+    column that is gone) before the view's own complaint."""
+    broken, views = {}, [tuple(v) for v in views]
     for i in range(0, len(views), CHECKED_AT_ONCE):
         chunk = views[i:i + CHECKED_AT_ONCE]
-        named = {f"{schema}.{v}": v for v in chunk}
-        listed = ", ".join(f"{ident(schema)}.{ident(v)}" for v in chunk)
+        named = {f"{s}.{v}": (s, v) for s, v in chunk}
+        listed = ", ".join(f"{ident(s)}.{ident(v)}" for s, v in chunk)
         for table, _op, kind, text in run_template(conn, "check-views.sql", views=listed)[1]:
             view = named.get(str(table))
             if view and str(kind).lower() == "error" and str(text) != "Corrupt":
@@ -732,8 +732,8 @@ def checked_views(conn, schema, views):
 
 def view_findings(conn, schema, name):
     if server(conn) == MARIADB:
-        views = [r[0] for r in q(conn, "views.sql", s=schema, n=name)[1]]
-        found = checked_views(conn, schema, views)
+        views = [(schema, r[0]) for r in q(conn, "views.sql", s=schema, n=name)[1]]
+        found = [(v, message) for (_s, v), message in checked_views(conn, views)]
     else:
         found = q(conn, "view-errors.sql", s=schema, n=name)[1]
     return [(n, "VIEW", None, None, "error", message) for n, message in found]

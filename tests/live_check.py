@@ -22,10 +22,12 @@
    through `deploy` (and DDL in one refused), a lint error in a real
    preview, and a write under an autopilot lease.
 
-On MariaDB (Phase 11a) the reads run on tests/fixtures/app_owner_mariadb.sql
+On MariaDB (Phase 11) everything runs on tests/fixtures/app_owner_mariadb.sql
 — a sequence, a package and a column-level check besides — with the
 privilege MariaDB shows routines behind (SHOW CREATE ROUTINE from 11.3,
-SELECT on mysql.proc before), and every write must be refused.
+SELECT on mysql.proc before). The writes are the same, but where MariaDB
+differs: a routine replaced in one step, SET USER for another definer, views
+read back with CHECK TABLE, and a sequence written and a package refused.
 
 Never point this at a shared server: it creates an account and drops
 databases. Skipped unless PYTHIA_MYSQL_LIVE_HOST is set:
@@ -434,22 +436,10 @@ def body(entry, name):
 
 
 def view_ok(entry, schema, name):
+    if MARIADB:                  # it marks no view invalid: CHECK TABLE opens it
+        return rows(entry, f"check table `{schema}`.`{name}`")[-1][3] == "OK"
     return scalar(entry, "select table_comment from information_schema.tables where "
                          f"table_schema = '{schema}' and table_name = '{name}'") == "VIEW"
-
-
-def check_mariadb_refuses_writes(entry):
-    """Until Phase 11b, every write to MariaDB is refused before it runs."""
-    p = Project(dict(entry, database="app_owner"))
-    p.policy(source="confirm", data_dml="confirm")
-    for name, text in (("p_new.sql", "create procedure p_new() begin end"),
-                       ("rows.sql", "update t_order set total = total where id = 1")):
-        p.file(name, text)
-        code, _, why = p.run("apply", name)
-        assert code == 1 and "writes to it from its next phase" in why, (name, code, why)
-    assert scalar(entry, "select count(*) from information_schema.routines "
-                         "where routine_name = 'p_new'") == 0
-    ok("writes to MariaDB are refused before anything runs, until Phase 11b")
 
 
 def check_writes(entry):
@@ -473,6 +463,8 @@ grant select, show view on reporting.* to '{AGENT}'@'%';
         _release(entry, p)
         _lint(entry, p)
         _lease(entry, p)
+        if MARIADB:
+            _mariadb(entry, p)
     finally:
         human.FORCE_CONSOLE = None
 
@@ -497,18 +489,22 @@ def _routines(entry, p):
     newer = P_NEW.replace("select status", "select status, total")
     doc = p.preview("p_new.sql", newer)
     notes = " ".join(doc["rehearsal"]["notes"])
-    assert doc["created"] is False and "no CREATE OR REPLACE PROCEDURE" in notes, doc
+    replaces = "replaces it in one step" if MARIADB else "no CREATE OR REPLACE PROCEDURE"
+    assert doc["created"] is False and replaces in notes, doc
     p.approve(doc["token"])
     code, res, why = p.confirm("apply", "p_new.sql", "--confirm", doc["token"])
     assert code == 0, (code, why, res)
     assert "select status, total" in body(entry, "p_new")
     assert body(entry, "p_new__pythia_check") is None
-    ok("a CREATE for a procedure that exists replaces it, checked under a scratch name")
+    ok("a CREATE for a procedure that exists replaces it, "
+       + ("in one step (MariaDB's CREATE OR REPLACE)" if MARIADB
+          else "checked under a scratch name"))
 
     code, _, why = p.write("bad.sql", P_NEW.replace("select status", "selec status"))
-    assert code == 1 and "scratch name" in why and "1064" in why, (code, why)
+    said = "untouched" if MARIADB else "scratch name"
+    assert code == 1 and said in why and "1064" in why, (code, why)
     assert "select status, total" in body(entry, "p_new")
-    ok("a replacement MySQL refuses costs nothing: the procedure is untouched")
+    ok("a replacement the server refuses costs nothing: the procedure is untouched")
 
     code, res2, why = p.restore(res)
     assert code == 0, (code, why, res2)
@@ -543,17 +539,20 @@ def _views(entry, p):
     doc = p.json("journal", "restore", eid)
     p.approve(doc["token"])
     code, _, why = p.confirm("journal", "restore", eid, "--confirm", doc["token"])
-    assert code == 1 and "SET_ANY_DEFINER" in why and "nothing was written" in why, (code, why)
+    need = "SET USER" if MARIADB else "SET_ANY_DEFINER"
+    assert code == 1 and need in why and "nothing was written" in why, (code, why)
     ok("restoring root's view is refused for this account, and nothing was written")
-    # root is a system account: setting it as a definer takes SYSTEM_USER too
-    run_script(entry, f"grant set_any_definer, system_user on *.* to '{AGENT}'@'%';")
+    # MySQL: root is a system account, so setting it as a definer takes
+    # SYSTEM_USER too; MariaDB asks for SET USER alone
+    may = "set user" if MARIADB else "set_any_definer, system_user"
+    run_script(entry, f"grant {may} on *.* to '{AGENT}'@'%';")
     code, res, why = p.confirm("journal", "restore", eid, "--confirm", doc["token"])
-    run_script(entry, f"revoke set_any_definer, system_user on *.* from '{AGENT}'@'%';")
+    run_script(entry, f"revoke {may} on *.* from '{AGENT}'@'%';")
     assert code == 0 and view_ok(entry, "app_owner", "v_summary_top"), (code, why, res)
     assert scalar(entry, "select definer from information_schema.views where "
-                         "table_name = 'v_order_summary'") == "root@%"
+                         "table_schema = 'app_owner' and table_name = 'v_order_summary'") == "root@%"
     ok("the approval was unspent: the same command, run again by an account that may, "
-       "restores root's view, and MySQL marks v_summary_top valid again")
+       "restores root's view, and v_summary_top opens again")
     code, _, why = p.run("apply", p.file("v_bad.sql", "create or replace view app_owner.v_bad "
                                          "as select nope from app_owner.t_order"))
     assert code == 1 and "1054" in why and "nothing was written" in why.lower(), why
@@ -591,7 +590,7 @@ insert into app_owner.t_order_line (order_id, qty) values (1, 1);
     code, out, why = p.run("apply", p.file("qty.sql", "update app_owner.t_order_line set qty = 2 "
                                            "where order_id = 1"))
     assert scalar(entry, "select qty from app_owner.t_order_line where order_id = 1") == 1
-    if scalar(entry, "select @@enforce_gtid_consistency") in ("ON", 1, "1"):
+    if not MARIADB and scalar(entry, "select @@enforce_gtid_consistency") in ("ON", 1, "1"):
         # MySQL refuses a statement writing both kinds of table itself (1785)
         assert code == 1 and "1785" in why and "nothing was written" in why.lower(), (code, why)
         assert scalar(entry, "select count(*) from app_owner.t_line_log") == 0
@@ -618,7 +617,7 @@ def _breakage(entry, p):
     code, _, why = p.confirm("apply", "drop.sql", "--confirm", doc["token"])
     assert code == 1 and "reporting.v_note3" in why and "moved" in why, why
     assert scalar(entry, "select count(*) from information_schema.columns where "
-                         "table_name = 't_order' and column_name = 'note2'") == 1
+                         "table_schema = 'app_owner' and table_name = 't_order' and column_name = 'note2'") == 1
     ok("a prediction that moved after approval is refused: nothing ran")
     code, res, why = p.write("drop.sql", drop)
     assert code == 3 and {b[0] for b in res["broken"]} == {"v_note2", "reporting.v_note3"}, \
@@ -638,11 +637,11 @@ def _comments_and_session(entry, p):
                                             "'Orders, every one'")
     assert code == 0, (code, why, res)
     assert scalar(entry, "select table_comment from information_schema.tables where "
-                         "table_name = 't_order'") == "Orders, every one"
+                         "table_schema = 'app_owner' and table_name = 't_order'") == "Orders, every one"
     code, _, why = p.restore(res)
     assert code == 0, why
     assert scalar(entry, "select table_comment from information_schema.tables where "
-                         "table_name = 't_order'") == "Customer orders, 'all' of them"
+                         "table_schema = 'app_owner' and table_name = 't_order'") == "Customer orders, 'all' of them"
     ok("a table comment written, read back and restored")
     code, out, why = p.run("apply", p.file("session.sql", "set @pythia = 1"))
     assert code == 0 and "Session setting applied" in out, (why, out)
@@ -697,7 +696,7 @@ def _release(entry, p):
     assert code == 1 and "ddl.sql:2" in why and "apply it on its own" in why.lower(), why
     assert scalar(entry, "select count(*) from app_owner.t_order where total = 8") == 0
     assert scalar(entry, "select count(*) from information_schema.columns where "
-                         "table_name = 't_order' and column_name = 'in_release'") == 0
+                         "table_schema = 'app_owner' and table_name = 't_order' and column_name = 'in_release'") == 0
     ok("DDL in a release is refused, and nothing before it lands")
 
 
@@ -732,17 +731,46 @@ def _lease(entry, p):
     code, res, why = p.confirm("apply", "c1.sql")
     assert code == 0 and res["applied"] and res["confirmed_via"] == "autopilot", (why, res)
     assert scalar(entry, "select table_comment from information_schema.tables where "
-                         "table_name = 't_order'") == "orders, under a lease"
+                         "table_schema = 'app_owner' and table_name = 't_order'") == "orders, under a lease"
     code, doc3, why = p.confirm("apply", p.file("s1.sql", "alter table app_owner.t_order "
                                                           "add column under_lease int"))
     assert code == 0 and doc3["will_apply"] is False, why
     assert "does not cover structural" in doc3["autopilot"]["why"], doc3["autopilot"]
     assert scalar(entry, "select count(*) from information_schema.columns where "
-                         "table_name = 't_order' and column_name = 'under_lease'") == 0
+                         "table_schema = 'app_owner' and table_name = 't_order' and column_name = 'under_lease'") == 0
     code, report, _ = p.confirm("autopilot", "report")
     assert [w["verdict"] for w in report["writes"]] == ["ok"], report
     assert p.run("autopilot", "off")[0] == 0
     ok("autopilot: an approved lease lands a covered write — a predicted one — and only that")
+
+
+def _mariadb(entry, p):
+    """What only MariaDB writes: a sequence, its views; a package refused."""
+    run_script(entry, "create view app_owner.v_next as "
+                      "select nextval(app_owner.s_order) as next_id;")
+    doc = p.preview("seq.sql", "create sequence app_owner.s_invoice start with 1")
+    assert doc["rehearsal"]["predicted"] is True and doc["rehearsal"]["broken"] == [], doc
+    code, res, why = p.write("seq.sql", "create sequence app_owner.s_invoice start with 1")
+    assert code == 0, (code, why, res)
+    assert scalar(entry, "select count(*) from information_schema.tables where "
+                         "table_schema = 'app_owner' and table_name = 's_invoice' and table_type = 'SEQUENCE'") == 1
+    ok("a sequence created through the gate, predicted then written")
+    doc = p.preview("drop_seq.sql", "drop sequence app_owner.s_order")
+    assert [b[0] for b in doc["rehearsal"]["broken"]] == ["v_next"], doc["rehearsal"]
+    assert "p_order_number" in doc["rehearsal"]["blind"], doc["rehearsal"]
+    p.approve(doc["token"])
+    code, res, why = p.confirm("apply", "drop_seq.sql", "--confirm", doc["token"])
+    assert code == 3 and [b[0] for b in res["broken"]] == ["v_next"], (code, why, res)
+    assert res["differs"] == [] and not view_ok(entry, "app_owner", "v_next"), res
+    ok("dropping a sequence breaks the view drawing from it, as predicted: exit 3")
+    for name, text, said in (
+            ("pkg.sql", "create or replace package app_owner.pkg_order as\n"
+                        "    function f_count return int;\nend", "read only"),
+            ("ret.sql", "delete from app_owner.t_order_audit where id = 0 returning id",
+             "RETURNING")):
+        code, _, why = p.run("apply", p.file(name, text))
+        assert code == 1 and said in why, (name, code, why)
+    ok("a package and a RETURNING are refused before anything runs")
 
 
 def main():
@@ -761,10 +789,7 @@ def main():
     check_reads(agent)
     check_read_session_refuses_writes(entry)
     check_ddl_round_trip(entry, agent)
-    if MARIADB:
-        check_mariadb_refuses_writes(entry)
-    else:
-        check_writes(entry)
+    check_writes(entry)
     print("OK")
 
 

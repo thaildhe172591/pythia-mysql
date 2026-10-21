@@ -1867,7 +1867,8 @@ def test_mariadb_impact_reads_view_definitions_not_a_usage_table():
         "resolve.sql": resolving(T_ORDER, F_TOTAL),
         "mariadb/dependents-catalog.sql": lambda b: (TREE, catalog.get((b["s"], b["n"], b["t"]),
                                                                        [])),
-        "mariadb/view-dependents.sql": lambda b: (TREE, views.get((b["s"], b["n"]), [])),
+        "mariadb/views-reading.sql": lambda b: (("s", "n"), [
+            r[:2] for r in views.get((b["s"], b["n"]), [])]),
         "dependents-text.sql": lambda b: (TREE + ("definition",), [
             ("app_owner", "p_paid", "PROCEDURE", "update t_order set status = 'PAID'")]
             if "t!_order" in b["p"] else []),
@@ -1942,11 +1943,201 @@ def test_mariadb_errors_check_every_view_and_give_the_cause():
     assert read.compile_errors(empty, "app_owner", None) == ([], None) and empty.texts == []
 
 
-def test_mariadb_is_read_only_until_its_write_path_lands():
-    conn = maria({})
-    ident = write.parse_object("create procedure p_new() begin end", "source")
-    expect_exit(lambda: write.snapshot(conn, "app_owner", "source", ident),
-                "MariaDB", "reads")
+# --- MariaDB (Phase 11b): the write path ---------------------------------------------------
+
+def check_tables(broken):
+    """CHECK TABLE as MariaDB answers it, for views in any schema: broken maps
+    'schema.view' to the cause MariaDB gives first."""
+    def answer(sql):
+        assert sql.strip().lower().startswith("check table") or "check table" in sql.lower()
+        rows = []
+        for s, v in re.findall(r"`(\w+)`\.`(\w+)`", sql):
+            key = f"{s}.{v}"
+            if key in broken:
+                rows += [(key, "check", "Error", broken[key]),
+                         (key, "check", "Error", f"View '{key}' references invalid table(s)"),
+                         (key, "check", "error", "Corrupt")]
+            else:
+                rows.append((key, "check", "status", "OK"))
+        return ("Table", "Op", "Msg_type", "Msg_text"), rows, len(rows)
+    return answer
+
+
+def probes(broken):
+    """A view opened with SELECT ... LIMIT 0, as the write path opens one:
+    broken maps 'schema.view' to the error MariaDB raises. CHECK TABLE is
+    refused here: it commits the transaction it runs in."""
+    def answer(sql):
+        code = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
+        assert "check table" not in code.lower(), "CHECK TABLE commits: never in a write"
+        found = re.findall(r"`(\w+)`\.`(\w+)`", sql)
+        if "limit 0" in sql.lower() and found:
+            key = "{}.{}".format(*found[0])
+            if key in broken:
+                raise DriverError(1356, broken[key])
+        return (), [], 0
+    return answer
+
+
+def maria_predicting(extra=None, broken=None):
+    answers = {"dependents-text.sql": ((), []), "rehearsal-settings.sql": ((), []),
+               "current-user.sql": (("account",), [("app_agent@%",)]),
+               "grants.sql": (("Grants",), [])}
+    answers.update(extra or {})
+    return maria(answers, script=probes(broken or {}))
+
+
+READING = {("app_owner", "t_order"): [("app_owner", "v_note"), ("app_owner", "v_paid")],
+           ("app_owner", "v_note"): [("app_owner", "v_note2")],
+           ("app_owner", "s_order"): [("app_owner", "v_next")]}
+
+
+def test_mariadb_ddl_is_predicted_from_definitions_and_checked_before():
+    conn = maria_predicting({
+        "views-using.sql": lambda b: (("s", "n"), [("app_owner", "v_note")]
+                                      if "`t_order`.`note`" in b["p"].replace("!_", "_")
+                                      else []),
+        "mariadb/views-reading.sql": lambda b: (("s", "n"), READING.get((b["s"], b["n"]), []))},
+        broken={"app_owner.v_paid": "Table 'app_owner.t_gone' doesn't exist"})
+    stmt = "alter table app_owner.t_order drop column note"
+    out = write.rehearse(conn, "app_owner", "structural", stmt, None, {}, DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_note", "v_note2"], out
+    pred = out["prediction"]
+    # every view that reads what the statement touches is checked, before and after
+    assert pred["checked"] == [["app_owner", "v_note"], ["app_owner", "v_note2"],
+                               ["app_owner", "v_paid"]], pred
+    assert pred["invalid_before"] == {"app_owner.v_paid": "1356: Table 'app_owner.t_gone' "
+                                                         "doesn't exist"}, pred
+    assert any("opens the 3 view(s)" in n and "MariaDB" in n for n in out["notes"]), out
+    assert "invalid-views.sql" not in conn.names()
+    # each opened with LIMIT 0: no CHECK TABLE, which would commit a release's rows
+    assert [re.findall(r"`\w+`\.`\w+`", x)[0] for x in conn.texts] == [
+        "`app_owner`.`v_note`", "`app_owner`.`v_note2`", "`app_owner`.`v_paid`"], conn.texts
+    # a sequence is MariaDB's: dropping it breaks the views that draw from it
+    out = write.rehearse(conn, "app_owner", "structural", "drop sequence s_order", None, {},
+                         DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_next"], out
+    mysql = predicting()
+    out = write.rehearse(mysql, "app_owner", "structural", "create sequence s_order", None,
+                         {}, DriverError)
+    assert "MySQL has no sequences" in out["error"], out
+
+
+def test_mariadb_finds_a_views_column_by_the_view_name_alone():
+    """MariaDB writes a table's column `schema`.`table`.`column`, but a view's
+    `view`.`column`: a column a view drops is found in the views reading it."""
+    defs = {("app_owner", "v_top"): "select `v_sum`.`total` AS `total` from `app_owner`.`v_sum`",
+            ("reporting", "v_other"): "select `v_sum`.`total` AS `t` from `reporting`.`v_sum`",
+            ("app_owner", "v_keep"): "select `v_sum`.`n` AS `n` from `app_owner`.`v_sum`"}
+    conn = maria_predicting({
+        "columns.sql": (("position", "column_name"), [(1, "status"), (2, "total")]),
+        "views-using.sql": lambda b: (("s", "n"), [
+            k for k, d in defs.items()
+            if b["p"].strip("%").replace("!_", "_").lower() in d.lower()]),
+        "mariadb/views-reading.sql": lambda b: (("s", "n"), [
+            k for k, d in defs.items() if f"`{b['s']}`.`{b['n']}`" in d])})
+    probe = conn.on_text
+    conn.on_text = (lambda sql: (("status", "n"), [], 0) if "pythia_view_probe" in sql
+                    else probe(sql))
+    stmt = "create or replace view app_owner.v_sum as select status, count(*) as n from t"
+    ident = write.parse_object(stmt, "source")
+    out = write.rehearse(conn, "app_owner", "source", stmt, ident,
+                         {"v_sum": "CREATE OR REPLACE ... AS\nselect"}, DriverError)
+    assert [b[0] for b in out["broken"]] == ["v_top"], out
+
+
+def test_mariadb_reads_back_what_opens_after_the_write():
+    conn = maria({}, script=probes({
+        "app_owner.v_note": "Unknown column 'note' in 'SELECT'",
+        "reporting.v_extra": "Table 'app_owner.t_order' doesn't exist",
+        "app_owner.v_old": "Table 'app_owner.t_x' doesn't exist"}))
+    outcome = {"prediction": {
+        "invalid_before": {"app_owner.v_old": "Table 'app_owner.t_x' doesn't exist"},
+        "broken": ["v_gone", "v_note"],
+        "checked": [["app_owner", "v_gone"], ["app_owner", "v_note"], ["app_owner", "v_old"],
+                    ["reporting", "v_extra"]]}}
+    got = write.verify_written(conn, "app_owner", "structural", "alter table t", None, outcome,
+                               DriverError)
+    assert [b[0] for b in got["broken"]] == ["reporting.v_extra", "v_note"], got
+    assert got["broken"][1][2] == "1356: Unknown column 'note' in 'SELECT'", got
+    assert got["differs"] == [
+        "reporting.v_extra cannot be opened now; the prediction did not say so",
+        "v_gone was predicted invalid, and it opens"], got
+    assert "invalid-views.sql" not in conn.names()
+
+
+def test_mariadb_replaces_a_routine_in_one_step():
+    ident = write.parse_object(NEW_P, "source")
+    conn, ran = replacing()
+    conn.server_info = MARIA_INFO
+    assert write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError) == {}
+    assert ran == [NEW_P.replace("create procedure", "create OR REPLACE procedure")], ran
+    conn, ran = replacing({"OR REPLACE": DriverError(1064, "You have an error in your SQL")})
+    conn.server_info = MARIA_INFO
+    out = write.execute(conn, "app_owner", "source", NEW_P, ident, DriverError)
+    assert "1064" in out["error"] and "untouched" in out["error"] and len(ran) == 1, out
+    conn, ran = replacing({"OR REPLACE": DriverError(2013, "Lost connection")})
+    conn.server_info = MARIA_INFO
+    assert "no answer" in write.execute(conn, "app_owner", "source", NEW_P, ident,
+                                        DriverError)["escaped"]
+    # written OR REPLACE already: run as it is
+    mine = NEW_P.replace("create procedure", "create or replace procedure")
+    conn, ran = replacing()
+    conn.server_info = MARIA_INFO
+    write.execute(conn, "app_owner", "source", mine, write.parse_object(mine, "source"),
+                  DriverError)
+    assert ran == [mine], ran
+
+
+def test_mariadb_says_how_it_replaces_and_mysql_refuses_its_or_replace():
+    snap = {"p_paid": "CREATE DEFINER=`root`@`%` PROCEDURE `app_owner`.`p_paid`()\nbegin end"}
+    conn = maria_predicting({"resolve.sql": resolving(P_PAID)})
+    ident = write.parse_object(NEW_P, "source")
+    out = write.rehearse(conn, "app_owner", "source", NEW_P, ident, snap, DriverError)
+    notes = " ".join(out["notes"])
+    assert "one step" in notes and "CREATE OR REPLACE" in notes, notes
+    assert "scratch" not in notes and "no CREATE OR REPLACE" not in notes, notes
+    assert "SET USER" in notes and "SET_ANY_DEFINER" not in notes, notes
+    mine = NEW_P.replace("create procedure", "create or replace procedure")
+    out = write.rehearse(predicting(), "app_owner", "source", mine,
+                         write.parse_object(mine, "source"), snap, DriverError)
+    assert "MySQL has no CREATE OR REPLACE PROCEDURE" in out["error"], out
+
+
+def test_mariadb_names_its_own_powerful_privileges():
+    def warn(*lines, info=MARIA_INFO):
+        conn = maria({"grants.sql": (("Grants",), [(g,) for g in lines]),
+                      "current-user.sql": (("account",), [("app_agent@%",)])}, info=info)
+        return write.privilege_warning(conn, "app_owner")
+    assert "(SET USER)" in warn("GRANT SET USER ON *.* TO `app_agent`@`%` IDENTIFIED BY "
+                                "PASSWORD '*69DF4E42'")
+    assert "every privilege" in warn("GRANT SUPER ON *.* TO `app_agent`@`%`")
+    assert warn("GRANT SELECT ON `app_owner`.* TO `app_agent`@`%`") is None
+    conn = maria({"grants.sql": (("Grants",), [("GRANT SET USER ON *.* TO `a`@`%`",)])})
+    assert write._may_set_definer(conn)
+
+
+def test_what_only_mariadb_writes_is_classified():
+    for text in ("create package pkg_order as function f return int; end",
+                 "create or replace package body pkg_order as function f return int as "
+                 "begin return 1; end; end",
+                 "drop package pkg_order", "drop package body pkg_order"):
+        group, why = write.classify(text)
+        assert group is None and "read only" in why and "package" in why.lower(), (text, why)
+    for text in ("insert into t_order (status) values ('DRAFT') returning id",
+                 "delete from t_order where id = 1 returning *"):
+        group, why = write.classify(text)
+        assert group is None and "RETURNING" in why, (text, why)
+    group, why = write.classify("delete history from t_order before system_time now()")
+    assert group is None and "history" in why.lower(), why
+    for text in ("create sequence s_order start with 100", "alter sequence s_order restart",
+                 "drop sequence s_order", "create or replace sequence s_order"):
+        assert write.classify(text) == ("structural", None), text
+    assert "rows" in write.destructive_reason("create or replace table t (id int)",
+                                              "structural")
+    assert "starts again" in write.destructive_reason("create or replace sequence s_order",
+                                                      "structural")
+    assert write.classify("create table package (id int)") == ("structural", None)
 
 
 def main():

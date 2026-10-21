@@ -9,7 +9,7 @@ its siblings do on PostgreSQL, SQL Server and MongoDB: the agent learns
 from the live catalog, asks a person before any write, and writes only
 through a gate that snapshots, verifies and reports honestly.
 
-**Alpha (0.1.0).** It reads everything pythia's Learn movement needs,
+**Alpha (0.2.0).** It reads everything pythia's Learn movement needs,
 writes through one gate — data rehearsed in a transaction, DDL predicted,
 written once and read back — and wires a project for an agent: the guard,
 the session brief, the approval doors and the `pythia-mysql-*` skills.
@@ -20,13 +20,12 @@ the session brief, the approval doors and the `pythia-mysql-*` skills.
 | writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
-**MariaDB (Phase 11a, on main, not yet on PyPI):** every read command, from
-MariaDB's own catalog. Writes to MariaDB are refused before anything runs
-until Phase 11b.
+MariaDB is read and written through the same commands, from its own
+catalog; where it differs, the MariaDB sections below say how.
 
 MySQL 8.4 LTS is the floor: CI runs the whole live check on 8.4, 9.4 and
-9.5. MariaDB's floor is 10.11 LTS: CI runs the reads on 10.11, 11.4 and
-11.8. Below either floor `check` says so (nothing is refused).
+9.5. MariaDB's floor is 10.11 LTS: CI runs the whole live check on 10.11,
+11.4 and 11.8. Below either floor `check` says so (nothing is refused).
 
 ## Install
 
@@ -206,8 +205,6 @@ server, and every message names the one it reached.
   they need and puts the session's back. A column-level `CHECK` is rebuilt
   on its column, an ignored index as `IGNORED`, and a system-versioned
   table's `ddl` says that its versioning is not rebuilt.
-- **Writes wait for Phase 11b.** `apply` and `deploy` against MariaDB are
-  refused before anything runs, with nothing written.
 
 ### Writing: the gate
 
@@ -385,6 +382,36 @@ MySQL commits DDL as it runs it, so the write path is split in two:
   parentheses that do not balance); and a routine whose body this account
   cannot read (nothing to snapshot).
 
+### MariaDB: what the write path does differently
+
+The gate is the same — data rehearsed, DDL predicted — and where MariaDB
+differs, so does the gate:
+
+- **A prediction opens the views, before and after.** MariaDB marks no view
+  invalid, so the views reading what a statement touches — found in their
+  definitions, transitively — are each opened with `SELECT ... LIMIT 0`
+  before the preview and again after the write; the ones that stopped
+  opening are what broke, and anything unlike the prediction exits 3. A
+  view of a view names its columns `` `view`.`column` ``, without the
+  schema, and the prediction reads them so. `CHECK TABLE` is never run
+  there: it commits the transaction it runs in, and the rows a release had
+  rehearsed would land with it.
+- **A routine is replaced in one step.** MariaDB has `CREATE OR REPLACE` for
+  procedures, functions, triggers and events, and keeps the old one when it
+  refuses the new: a `CREATE` for one that exists runs as `CREATE OR
+  REPLACE`, with no scratch copy and no moment without a trigger. MySQL has
+  no such statement, and `CREATE OR REPLACE PROCEDURE` there is refused
+  with the way forward.
+- **Another definer needs `SET USER`** (or `SUPER`); the preview says when
+  this account could not put the old definer back, and names an account
+  holding `SET USER` as one that may act as any account.
+- **Sequences are written** (`CREATE`, `ALTER`, `DROP SEQUENCE`), as DDL:
+  predicted, and a `DROP` breaks the views that draw from the sequence.
+  `CREATE OR REPLACE TABLE` and `CREATE OR REPLACE SEQUENCE` are
+  destructive: they drop the old one first.
+- **Refused, with the reason:** a package (read only), `RETURNING`, `DELETE
+  HISTORY`.
+
 pythia-mysql never turns on `MULTI_STATEMENTS` or `LOCAL INFILE`: MySQL
 itself refuses any text after the one statement sent. A write waits at most
 5 s for a lock (`innodb_lock_wait_timeout`, `lock_wait_timeout`). A
@@ -420,8 +447,8 @@ A write needs what the change needs, on its schema only — for example
 `INSERT, UPDATE, DELETE` for data, `CREATE, ALTER, DROP, INDEX, CREATE
 VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT` for DDL. An account
 holding every privilege on the server, `SUPER`, `SYSTEM_USER`,
-`SET_ANY_DEFINER` or `SET_USER_ID` is named in the preview: far more than a
-change needs. The live check runs every write path as an account whose
+`SET_ANY_DEFINER`, `SET_USER_ID` or MariaDB's `SET USER` is named in the
+preview: far more than a change needs. The live check runs every write path as an account whose
 write privileges stop at its schema.
 
 ## Tests
@@ -434,8 +461,8 @@ python tests/live_check.py    # a disposable server only (see its docstring)
 CI runs the suite on Ubuntu, Windows and macOS, Python 3.9 and 3.13, and
 the live check — every read, every write path, a release, a lint finding in
 a real preview and a write under a lease — against MySQL 8.4, 9.4 and 9.5
-in service containers; against MariaDB 10.11, 11.4 and 11.8, every read, a
-`ddl` round trip of each object, and the refusal of every write. It tests
+in service containers, and against MariaDB 10.11, 11.4 and 11.8 — with a
+sequence, a package and MariaDB's own write paths besides. It tests
 against the pythia-core branch of the same name when one exists.
 
 ## License

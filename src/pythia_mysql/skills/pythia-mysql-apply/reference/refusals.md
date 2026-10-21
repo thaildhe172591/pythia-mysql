@@ -27,6 +27,11 @@ offer the way forward below — never run the statement another way.
 | a schema other than the connection's | writing across schemas is refused | `--conn` for the connection that owns it |
 | a group set to `deny` | the policy | relay it; loosening is the developer's `policy set`, at a console |
 | a DDL statement in `deploy` | MySQL commits it as it runs, so a release cannot land it all or nothing | apply it on its own, before or after the release |
+| `CREATE OR REPLACE PROCEDURE` (or `FUNCTION`, `TRIGGER`, `EVENT`) on MySQL | MySQL has none | write `CREATE`: pythia-mysql replaces the one that exists |
+| `CREATE`, `ALTER`, `DROP SEQUENCE` on MySQL | MySQL has no sequences | — |
+| a MariaDB package (`CREATE PACKAGE`, `PACKAGE BODY`, `DROP PACKAGE`) | read only in pythia-mysql | the developer writes it by hand, or the logic moves into procedures and functions |
+| `RETURNING` (MariaDB) on an INSERT, REPLACE or DELETE | the write hands rows back, and its rows cannot be read beforehand | the statement without it |
+| `DELETE HISTORY` (MariaDB) | removes a system-versioned table's history for good, unrehearsable | a DBA runs it by hand |
 
 When the gate refuses, the developer may still decide to run the statement
 by hand. Hand them the file and, for a definition, the restore from

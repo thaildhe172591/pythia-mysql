@@ -37,7 +37,7 @@ import sys
 
 from pythia_core.output import cell
 
-from .catalog import MARIADB, fold, ident, like_contains, literal, q, server, sql_of
+from .catalog import MARIADB, fold, ident, like_contains, literal, q, run_template, server, sql_of
 from .read import HIDDEN, error_text, refers_to, statements
 
 SAMPLE_ROWS = 10
@@ -197,6 +197,16 @@ CANNOT = ("Cannot classify this statement, so it is refused rather than guessed 
 MANY = ("{n} statements in one file — apply takes one statement per file, so "
         "each is previewed, approved and journaled on its own (deploy takes a "
         "script). End every statement with ';'.")
+PACKAGES = ("A package (MariaDB, sql_mode=ORACLE) is read only in pythia-mysql: ls, src "
+            "and ddl read it, and nothing writes it. Write it by hand, or keep the "
+            "logic in procedures and functions, which apply writes.")
+RETURNING = ("RETURNING (MariaDB) makes a write hand rows back as a read does, and the "
+             "rows it touches cannot be read beforehand. Write the statement without it.")
+HISTORY = ("DELETE HISTORY removes a system-versioned table's history for good, and no "
+           "rehearsal shows what it removes. A DBA runs it by hand.")
+_PACKAGE = re.compile(r"(?:create|alter|drop)(?: or replace)?"
+                      r"(?: definer ?= ?(?:current_user(?: ?\( ?\))?|" + _Q
+                      + r"(?: ?@ ?" + _Q + r")?))?(?: sql security \w+)? package\b")
 
 RULES = (
     (r"(start transaction|begin|commit|rollback|savepoint|release savepoint|xa|"
@@ -232,6 +242,7 @@ RULES = (
      r"(?: sql security \w+)? (view|procedure|function|trigger|event)\b", "source", None),
     (r"alter table " + _Q + r"(?: ?\. ?" + _Q + r")? comment ?=? ?'[^']*'$", "comments",
      None),
+    (r"delete history\b", None, HISTORY),
     (r"(insert|replace|update|delete)\b", "data_dml", None),
     (r"(grant|revoke)\b", "grants", None),
     (r"set\b", "session", None),
@@ -273,6 +284,8 @@ def classify(text):
     for pattern, _group, why in RULES[:2]:     # BEGIN ...; ... reads as several
         if re.match(pattern, first):
             return None, why
+    if _PACKAGE.match(first):                   # its body's ';' reads as several too
+        return None, PACKAGES
     if len(stmts) > 1:
         return None, MANY.format(n=len(stmts))
     if _stored_program(first) and _code_after_program(stmts[0]):
@@ -294,6 +307,8 @@ def classify(text):
                 why = _grant_scope(stmts[0])
                 if why:
                     return None, why
+            if group == "data_dml" and re.search(r"\breturning\b", first):
+                return None, RETURNING
             return group, why
     return None, CANNOT
 
@@ -396,6 +411,12 @@ def destructive_reason(stmt, group):
     """Why no journal brings this statement's work back, or None."""
     code = _code(stmt)
     if group == "structural":
+        if code.startswith("create or replace table "):
+            return ("CREATE OR REPLACE TABLE drops the table, and its rows with it, "
+                    "before it creates the new one")
+        if code.startswith("create or replace sequence "):
+            return ("CREATE OR REPLACE SEQUENCE drops the sequence: the new one starts "
+                    "again, and the values it had reached are gone")
         if code.startswith("drop "):
             return "DROP removes the object and everything in it"
         if code.startswith("truncate "):
@@ -569,19 +590,9 @@ def _definition(conn, schema, ident_):
     return None
 
 
-MARIADB_READS_ONLY = ("Refused: pythia-mysql reads MariaDB, and writes to it from its next "
-                      "phase (11b); this version writes to MySQL only. Nothing was written.")
-
-
-def _writes_here(conn):
-    if server(conn) == MARIADB:
-        sys.exit(MARIADB_READS_ONLY)
-
-
 def snapshot(conn, schema, group, ident_):
     """What the statement could replace, as it stands: a view's, routine's,
     trigger's or event's definition, or a table's comment."""
-    _writes_here(conn)
     target_schema = ident_.get("schema") or schema
     if group == "source":
         text = _definition(conn, target_schema, ident_)
@@ -612,7 +623,6 @@ def _settings(conn):
 def rehearse(conn, schema, group, stmt, ident_, snap, errors=Exception):
     """Data runs in the open transaction (core rolls a preview back and
     commits an approved write); everything else is predicted."""
-    _writes_here(conn)
     _settings(conn)
     if group == "session":
         try:
@@ -640,9 +650,10 @@ def _rehearse_data(conn, schema, stmt, errors):
     if target is None:
         return {"error": "the table this statement writes could not be read from it"}
     s, n = target[0] or schema, target[1]
+    name = server(conn)
     rows = q(conn, "table-engine.sql", s=s, n=n)[1]
     if rows and rows[0][1] != "YES":
-        return {"error": (f"{n} is a {rows[0][0]} table: MySQL cannot roll a write to it "
+        return {"error": (f"{n} is a {rows[0][0]} table: {name} cannot roll a write to it "
                           "back, so pythia-mysql cannot rehearse it — and writes nothing "
                           "it has not rehearsed. Convert it to InnoDB, or a DBA writes "
                           "it by hand.")}
@@ -656,8 +667,8 @@ def _rehearse_data(conn, schema, stmt, errors):
     if any(int(w[1]) == NOT_ROLLED_BACK for w in q(conn, "warnings.sql")[1]):
         return {"schema": schema, "error": f"{NOT_ROLLED_BACK}: some changed tables "
                 "could not be rolled back",
-                "escape_head": "MySQL could not roll the rehearsal back",
-                "escaped": ("a trigger or function wrote to a table MySQL cannot roll "
+                "escape_head": f"{name} could not roll the rehearsal back",
+                "escaped": (f"a trigger or function wrote to a table {name} cannot roll "
                             "back (MyISAM, MEMORY): those rows are written, though the "
                             "statement itself was rolled back")}
     try:
@@ -669,7 +680,7 @@ def _rehearse_data(conn, schema, stmt, errors):
             "notes": ["a rehearsal fires the statement's triggers and draws "
                       "AUTO_INCREMENT values: rolling back undoes the rows, not "
                       "those; it runs twice, the first time in a savepoint, to find "
-                      "a write MySQL cannot roll back"]}
+                      f"a write {name} cannot roll back"]}
 
 
 # --- predicting DDL ----------------------------------------------------------------------------
@@ -698,6 +709,13 @@ def _closure(conn, seeds):
 
 
 def _views_using_column(conn, s, t, column):
+    if server(conn) == MARIADB:
+        # MariaDB writes a table's column `schema`.`table`.`column` but a
+        # view's `view`.`column`: either way `t`.`column`, in a view reading s.t
+        reading = {tuple(r) for r in q(conn, "views-reading.sql", s=s, n=t)[1]}
+        pattern = like_contains(f"{ident(t)}.{ident(column)}")
+        return [(vs, vn) for vs, vn in q(conn, "views-using.sql", p=pattern)[1]
+                if (vs, vn) in reading]
     pattern = like_contains(f"{ident(s)}.{ident(t)}.{ident(column)}")
     return [(vs, vn) for vs, vn in q(conn, "views-using.sql", p=pattern)[1]]
 
@@ -722,8 +740,36 @@ def _leads(conn, s, n):
                   if refers_to(body, n, rs, s))
 
 
+_SEQUENCE = re.compile(r"\s*(?:create|alter|drop)(?:\s+or\s+replace)?\s+sequence\b", re.I)
+
+
+def opened_views(conn, views, errors):
+    """{(schema, view): why} for the views MariaDB cannot open: each selected
+    with LIMIT 0. Never CHECK TABLE here: it commits the transaction it runs
+    in, and a release's rehearsed rows would land with it."""
+    broken = {}
+    for s, v in views:
+        try:
+            run_template(conn, "view-probe.sql", view=f"{ident(s)}.{ident(v)}")
+        except errors as e:
+            broken[(s, v)] = _said(e)
+    return broken
+
+
+def _candidates(conn, touched, own=(), gone=()):
+    """The views opened before and after on MariaDB, which marks none invalid: a
+    view the statement writes, and every view reading what it touches,
+    transitively — not those it drops."""
+    found = set(_closure(conn, [(s, n, "x") for s, n in touched])) | set(own)
+    return sorted([s, n] for s, n in found - set(gone))
+
+
 def _predict(conn, schema, group, stmt, ident_, snap, errors):
-    before = {f"{s}.{n}": m for (s, n), m in invalid_views(conn).items()}
+    mariadb = server(conn) == MARIADB
+    if group == "structural" and not mariadb and _SEQUENCE.match(lex(stmt).uncommented):
+        return {"error": "MySQL has no sequences: CREATE, ALTER and DROP SEQUENCE are "
+                         "MariaDB's"}
+    before = {} if mariadb else {f"{s}.{n}": m for (s, n), m in invalid_views(conn).items()}
     if group == "source":
         out = _predict_source(conn, schema, stmt, ident_, snap, errors)
     elif group == "comments":
@@ -737,12 +783,22 @@ def _predict(conn, schema, group, stmt, ident_, snap, errors):
                           "a prediction can check")
     else:
         out = _predict_structural(conn, schema, stmt)
+    touched, own, gone = (out.pop(k, ()) for k in ("touched", "own", "gone"))
     if not out.get("error"):
         out["prediction"] = {"invalid_before": before,
                              "broken": sorted(b[0] for b in out["broken"])}
-        out["notes"].append("MySQL commits DDL as it runs it, so nothing ran: after "
-                            "the approval it runs once and the views MySQL marks "
-                            "invalid are read back")
+        if mariadb:
+            checked = _candidates(conn, touched, own, gone)
+            out["prediction"]["checked"] = checked
+            out["prediction"]["invalid_before"] = {
+                f"{s}.{n}": m for (s, n), m in opened_views(conn, checked, errors).items()}
+            out["notes"].append(f"MariaDB commits DDL as it runs it, so nothing ran: after "
+                                f"the approval it runs once, and pythia-mysql opens the "
+                                f"{len(checked)} view(s) reading what it touches")
+        else:
+            out["notes"].append("MySQL commits DDL as it runs it, so nothing ran: after "
+                                "the approval it runs once and the views MySQL marks "
+                                "invalid are read back")
     return out
 
 
@@ -801,18 +857,27 @@ def _predict_source(conn, schema, stmt, ident_, snap, errors):
         found = dict(seeds)
         found.update(_closure(conn, [(vs, vn, "would be invalid") for vs, vn in seeds]))
         out["broken"] = _broken(found, schema)
+        out["touched"], out["own"] = [(s, name)], [(s, name)]
         out["notes"].append("the view's SELECT ran with LIMIT 0: its names resolve")
         if exists:
             out["notes"].extend(_definer_notes(conn, otype, ident_, snap[name]))
         return out
+    mariadb = server(conn) == MARIADB
+    if ident_["replace"] and not mariadb:
+        return {"error": f"MySQL has no CREATE OR REPLACE {otype}: write CREATE {otype}, "
+                         "and pythia-mysql replaces the one that exists"}
     out = _base(name, otype, after, schema, verified=False,
-                blind=(f"MySQL checks a {otype.lower()}'s syntax when it is created, and "
-                       "the names inside it only when it runs: nothing in it was "
-                       "checked before the write"))
+                blind=(f"{server(conn)} checks a {otype.lower()}'s syntax when it is "
+                       "created, and the names inside it only when it runs: nothing in it "
+                       "was checked before the write"))
     if otype == "TRIGGER" and ident_.get("table") and not \
             q(conn, "table-engine.sql", s=s, n=ident_["table"])[1]:
         return {"error": f"no table {ident_['table']} for the trigger to be on"}
-    if exists:
+    if exists and mariadb:
+        out["notes"].append(f"MariaDB replaces it in one step (CREATE OR REPLACE {otype}): "
+                            "if it refuses the new one, the old one stays as it is")
+        out["notes"].extend(_definer_notes(conn, otype, ident_, snap[name]))
+    elif exists:
         how = ("checks the new one under a scratch name, drops the old one, creates "
                "the new one" if otype in ("PROCEDURE", "FUNCTION") else
                "drops the old one and creates the new one")
@@ -823,11 +888,12 @@ def _predict_source(conn, schema, stmt, ident_, snap, errors):
                                 "neither trigger")
         out["notes"].extend(_definer_notes(conn, otype, ident_, snap[name]))
     if otype == "FUNCTION":
+        out["touched"] = [(s, name)]
         users = [f"{vs}.{vn}" if vs != s else vn
                  for vs, vn in q(conn, "views-using-function.sql", s=s, n=name)[1]]
         if users:
-            out["notes"].append(f"{', '.join(users)} call {name}: MySQL checks them again "
-                                "after the write, and they are read back")
+            out["notes"].append(f"{', '.join(users)} call {name}: {server(conn)} checks "
+                                "them again after the write, and they are read back")
     return out
 
 
@@ -843,10 +909,13 @@ def _definer_notes(conn, otype, ident_, before):
         notes.append(f"the definer changes from {was} to {me}: a SQL SECURITY DEFINER "
                      f"{otype.lower()} then runs with {me}'s privileges")
     if not _may_set_definer(conn):
-        when = ("if MySQL refuses the new one, or later, " if otype != "VIEW" else "later ")
+        if server(conn) == MARIADB:     # it keeps the old one when it refuses the new
+            when, need = "later ", "SET USER, or SUPER"
+        else:
+            when = ("if MySQL refuses the new one, or later, " if otype != "VIEW" else "later ")
+            need = "SET_ANY_DEFINER, and SYSTEM_USER when the definer is a system account"
         notes.append(f"the old one's definer is {was}: {when}this account cannot put the "
-                     "old one back (that needs SET_ANY_DEFINER, and SYSTEM_USER when the "
-                     "definer is a system account); the journal keeps it for a DBA")
+                     f"old one back (that needs {need}); the journal keeps it for a DBA")
     return notes
 
 
@@ -855,7 +924,8 @@ def _may_set_definer(conn):
     for row in q(conn, "grants.sql")[1]:
         m = re.match(r"GRANT\s+(.*?)\s+ON\s+\*\.\*\s+TO\s", str(row[0]), re.I | re.S)
         held = {" ".join(p.split()).upper() for p in m.group(1).split(",")} if m else set()
-        if held & {"ALL", "ALL PRIVILEGES", "SUPER", "SET_USER_ID", "SET_ANY_DEFINER"}:
+        if held & {"ALL", "ALL PRIVILEGES", "SUPER", "SET_USER_ID", "SET_ANY_DEFINER",
+                   "SET USER"}:
             return True
     return False
 
@@ -865,9 +935,12 @@ def _who(definer):
     return re.sub(r"[`'\"]", "", definer)
 
 
-_DROP = re.compile(r"\s*drop\s+(?P<kind>table|view|procedure|function|trigger|event|index)"
+_DROP = re.compile(r"\s*drop\s+(?P<kind>table|view|sequence|procedure|function|trigger|"
+                   r"event|index)"
                    r"\s+(?:if\s+exists\s+)?(?P<names>.*)", re.I | re.S)
 _ALTER_TABLE = re.compile(r"\s*alter\s+table\s+" + _NAME + r"\s+(?P<rest>.*)", re.I | re.S)
+_OR_REPLACE = re.compile(r"\s*create\s+or\s+replace\s+(?P<kind>table|sequence)\s+" + _NAME,
+                         re.I)
 _RENAME_TABLE = re.compile(r"\s*rename\s+tables?\s+(?P<pairs>.*)", re.I | re.S)
 
 
@@ -906,7 +979,7 @@ def _predict_structural(conn, schema, stmt):
         for s, n in _names(names):
             s = s or schema
             gone.append((s, n))
-            if kind in ("table", "view"):
+            if kind in ("table", "view", "sequence"):
                 for vs, vn in q(conn, "views-reading.sql", s=s, n=n)[1]:
                     seeds[(vs, vn)] = f"it reads {s}.{n}, which this drops"
             elif kind == "function":
@@ -940,16 +1013,34 @@ def _predict_structural(conn, schema, stmt):
                     for vs, vn in _views_using_column(conn, s, t, col):
                         seeds[(vs, vn)] = f"it reads {s}.{t}.{col}, which this drops"
                     break
+    # what the statement touches: on MariaDB, the views reading it are the
+    # ones pythia-mysql opens before the write and after it
+    touched, named = list(gone), list(gone)
+    altered = _ALTER_TABLE.match(text)
+    if altered:
+        s, t = _qualified(altered)
+        touched.append((s or schema, t))
+    replaced = _OR_REPLACE.match(text)
+    if replaced:                     # MariaDB's: the old one goes, a new one comes
+        s, n = _qualified(replaced)
+        touched.append((s or schema, n))
+        named.append((s or schema, n))
     found = dict(seeds)
     found.update(_closure(conn, [(vs, vn, "would be invalid") for vs, vn in seeds]))
     out = _base(None, None, stmt, schema)
     out["broken"] = _broken(found, schema)
-    leads = sorted({lead for s, n in gone for lead in _leads(conn, s, n)})
+    out["touched"], out["gone"] = touched, list(gone)
+    if replaced:
+        out["notes"].append(f"CREATE OR REPLACE {replaced.group('kind').upper()} drops "
+                            f"{fold(replaced.group('name'))} and creates it again: whether "
+                            "the views reading it still open is checked after the write, "
+                            "not predicted")
+    leads = sorted({lead for s, n in named for lead in _leads(conn, s, n)})
     if leads:
         out.update(verified=False, blind=(
-            f"{', '.join(leads)} name what this drops or renames in their body: MySQL "
-            "checks those names only when they run, so whether they break was not "
-            "checked ([text] leads)"))
+            f"{', '.join(leads)} name what this drops or renames in their body: "
+            f"{server(conn)} checks those names only when they run, so whether they "
+            "break was not checked ([text] leads)"))
     return out
 
 
@@ -977,11 +1068,14 @@ def _scratch(stmt, ident_):
 
 def execute(conn, schema, group, stmt, ident_, errors=Exception):
     """Run a predicted statement once. MySQL's DDL is atomic: a statement it
-    refuses wrote nothing. A lost connection leaves it unknown."""
-    _writes_here(conn)
+    refuses wrote nothing. A lost connection leaves it unknown. MariaDB
+    replaces a routine, trigger or event in one step: its own CREATE OR
+    REPLACE, which keeps the old one when it refuses the new."""
     _settings(conn)
     if group == "source" and ident_ and ident_["type"] != "VIEW" and ident_["verb"] == "create":
         old = snapshot(conn, schema, group, ident_).get(ident_["name"])
+        if old is not None and server(conn) == MARIADB:
+            return _replace_in_one_step(conn, stmt, ident_, errors)
         if old is not None:
             return _replace(conn, schema, stmt, ident_, old, errors)
     failed = _run_or_none(conn, stmt, errors)
@@ -1031,12 +1125,35 @@ def _replace(conn, schema, stmt, ident_, old, errors):
             "error": _said(failed)}
 
 
+def _or_replace(stmt):
+    """CREATE ... as CREATE OR REPLACE ..., the rest as written."""
+    m = _SOURCE_HEAD.match(lex(stmt).uncommented)
+    if m.group("replace"):
+        return stmt
+    return stmt[:m.end("verb")] + " OR REPLACE" + stmt[m.end("verb"):]
+
+
+def _replace_in_one_step(conn, stmt, ident_, errors):
+    failed = _run_or_none(conn, _or_replace(stmt), errors)
+    if failed is None:
+        return {}
+    if _lost(failed):
+        return {"escaped": f"CREATE OR REPLACE {ident_['type']} {ident_['name']} was sent, "
+                           "and no answer says whether it landed", "error": _said(failed)}
+    return {"error": f"{_said(failed)} — MariaDB refused it, and the old "
+                     f"{ident_['type'].lower()} is untouched"}
+
+
 def verify_written(conn, schema, group, stmt, ident_, outcome, errors=Exception):
     """What the write left: views MySQL marked invalid that were not before,
     and every way that differs from the prediction."""
     prediction = outcome.get("prediction") or {}
     before = set(prediction.get("invalid_before") or {})
-    now = invalid_views(conn)
+    mariadb = server(conn) == MARIADB
+    if mariadb:              # it marks nothing: the views the prediction named are opened
+        now = opened_views(conn, prediction.get("checked") or [], errors)
+    else:
+        now = invalid_views(conn)
     own, broken, differs = [], [], []
     for (s, n), message in sorted(now.items()):
         if f"{s}.{n}" in before:
@@ -1049,10 +1166,10 @@ def verify_written(conn, schema, group, stmt, ident_, outcome, errors=Exception)
             broken.append(row)
     said = set(prediction.get("broken") or [])
     seen = {b[0] for b in broken}
-    differs += [f"{v} is marked invalid now; the prediction did not say so"
-                for v in sorted(seen - said)]
-    differs += [f"{v} was predicted invalid, and MySQL did not mark it"
-                for v in sorted(said - seen)]
+    now_word = "cannot be opened now" if mariadb else "is marked invalid now"
+    not_word = "and it opens" if mariadb else "and MySQL did not mark it"
+    differs += [f"{v} {now_word}; the prediction did not say so" for v in sorted(seen - said)]
+    differs += [f"{v} was predicted invalid, {not_word}" for v in sorted(said - seen)]
     if group == "source" and ident_:
         differs += _read_back_source(conn, schema, stmt, ident_)
     elif group == "comments" and ident_:
@@ -1093,7 +1210,8 @@ def privilege_warning(conn, schema):
         return (f"! {who} holds every privilege on the whole server: it can do far "
                 "more than this change needs. An account with only the rights the "
                 "change needs is safer.")
-    if held & {"SYSTEM_USER", "SET_USER_ID", "SET_ANY_DEFINER"}:
-        return (f"! {who} may act as any account (SYSTEM_USER, SET_USER_ID): far more "
-                "than this change needs.")
+    if held & {"SYSTEM_USER", "SET_USER_ID", "SET_ANY_DEFINER", "SET USER"}:
+        names = ("SET USER" if server(conn) == MARIADB else "SYSTEM_USER, SET_USER_ID")
+        return (f"! {who} may act as any account ({names}): far more than this change "
+                "needs.")
     return None

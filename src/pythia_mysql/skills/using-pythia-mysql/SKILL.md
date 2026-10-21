@@ -1,14 +1,14 @@
 ---
 name: using-pythia-mysql
-description: Use when starting any conversation that touches MySQL, a schema, a stored procedure, a function, a trigger, an event or a view - it picks the right pythia-mysql skill BEFORE any response or action, including clarifying questions. Fires on plain requests in any language - "build/add/fix/explain/review X", "lam/them/sua/tao/giai thich/kiem tra X" (Vietnamese, with or without diacritics). Also use whenever unsure which pythia-mysql skill applies.
+description: Use when starting any conversation that touches MySQL or MariaDB, a schema, a stored procedure, a function, a trigger, an event or a view - it picks the right pythia-mysql skill BEFORE any response or action, including clarifying questions. Fires on plain requests in any language - "build/add/fix/explain/review X", "lam/them/sua/tao/giai thich/kiem tra X" (Vietnamese, with or without diacritics). Also use whenever unsure which pythia-mysql skill applies.
 ---
 
 # Using pythia-mysql — the pocket handbook
 
 **Phase:** Learn → Ask → Do — this page opens the right one
 
-pythia-mysql is pythia for MySQL and MariaDB (read; writes to MariaDB wait
-for Phase 11b). Its one job here is consistency: whether
+pythia-mysql is pythia for MySQL and MariaDB. Its one job here is
+consistency: whether
 a session measures the blast radius and asks before it writes should not
 depend on the agent's mood that day.
 

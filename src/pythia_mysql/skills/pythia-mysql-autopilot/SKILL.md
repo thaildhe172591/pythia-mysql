@@ -1,6 +1,6 @@
 ---
 name: pythia-mysql-autopilot
-description: Use when the developer wants the agent to work on MySQL without approving every write - "do it all without asking me", "just apply them", "tự động hoàn toàn". Asks once for a lease that names exactly what it covers, then reports every write landed under it.
+description: Use when the developer wants the agent to work on MySQL or MariaDB without approving every write - "do it all without asking me", "just apply them", "tự động hoàn toàn". Asks once for a lease that names exactly what it covers, then reports every write landed under it.
 ---
 
 # Autopilot — one lease, never a blank cheque
