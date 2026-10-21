@@ -1,0 +1,12 @@
+{
+  "default": "dev",
+
+  "dev": {
+    "host": "",
+    "port": 3306,
+    "database": "app_owner",
+    "user": "",
+    "password": "",
+    "tls": "request"
+  }
+}

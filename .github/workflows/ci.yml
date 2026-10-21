@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # nothing to install: the suite stands in for PyMySQL and finds core's src/
+      - run: python -m compileall -q src tests
+      - run: python tests/test_mysql.py
+        env:
+          PYTHIA_CORE_SRC: ${{ github.workspace }}/.core/src
+
+  live:
+    # a disposable server per run; never a shared one
+    strategy:
+      fail-fast: false
+      matrix:
+        # the floor (8.4 LTS) up to the newest innovation release
+        mysql: ["8.4", "9.4", "9.5"]
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: "CiOnly#Disposable1"
+        ports: ["3306:3306"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install ./.core .
+      # the image initialises, restarts, then listens: wait with PyMySQL
+      - name: wait for MySQL ${{ matrix.mysql }}
+        run: |
+          python - <<'PY'
+          import time, pymysql
+          for _ in range(90):
+              try:
+                  pymysql.connect(host="127.0.0.1", port=3306, user="root",
+                                  password="CiOnly#Disposable1", connect_timeout=5).close()
+                  break
+              except pymysql.Error:
+                  time.sleep(2)
+          else:
+              raise SystemExit("MySQL did not answer")
+          PY
+      - run: python tests/live_check.py
+        env:
+          PYTHIA_MYSQL_LIVE_HOST: 127.0.0.1
+          PYTHIA_MYSQL_LIVE_PORT: "3306"
+          PYTHIA_MYSQL_LIVE_USER: root
+          PYTHIA_MYSQL_LIVE_PASSWORD: "CiOnly#Disposable1"
+          PYTHIA_MYSQL_LIVE_DISPOSABLE: "1"
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/checkout-core
+        with:
+          token: ${{ secrets.PYTHIA_CORE_TOKEN || github.token }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip wheel . --no-deps -w dist
+      - run: pip install ./.core dist/*.whl
+      # the console script and the queries must work outside the repo layout
+      - run: cd /tmp && pythia-mysql version && pythia-mysql --help | grep -q impact
+      - run: cd /tmp && python -c "from pythia_mysql.catalog import QUERY_BINDS, QUERY_DIR; assert all((QUERY_DIR / q).is_file() for q in QUERY_BINDS)"

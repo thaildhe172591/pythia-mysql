@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pythia-mysql"
+version = "0.1.0.dev0"
+description = "pythia for MySQL: stored-program development for AI agents over pythia-core - catalog queries, impact analysis and an approved write path."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+# pythia-core and the driver, nothing else (tests/test_mysql.py). PyMySQL is
+# pure Python and still runs on 3.9; 1.2 negotiates TLS whenever the server
+# offers it, the "request" default.
+dependencies = ["pythia-core>=0.1.1,<0.2", "PyMySQL>=1.2"]
+keywords = ["mysql", "stored-procedures", "database", "agent-skills"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Repository = "https://github.com/thaildhe172591/pythia-mysql"
+Changelog = "https://github.com/thaildhe172591/pythia-mysql/blob/main/CHANGELOG.md"
+Issues = "https://github.com/thaildhe172591/pythia-mysql/issues"
+
+[project.scripts]
+pythia-mysql = "pythia_mysql.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pythia_mysql = ["queries/*.sql"]
