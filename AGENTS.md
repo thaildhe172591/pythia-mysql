@@ -1,7 +1,7 @@
 # Working in this repository / with this tool
 
 pythia-mysql is pythia for MySQL and MariaDB, on pythia-core. It is alpha
-(0.2.0): it reads everything pythia's Learn movement needs, and writes
+(0.3.0): it reads everything pythia's Learn movement needs, and writes
 through one gate — data rehearsed in a transaction, DDL predicted, written
 once and read back. `pythia-mysql install` wires a project: the guard, the
 session brief and the `pythia-mysql-*` skills (`using-pythia-mysql`
@@ -118,7 +118,7 @@ routes).
   commands; the prose is translated by hand.
 - **Versions** agree in pyproject.toml and `pythia_mysql.__version__`, the
   version has its CHANGELOG.md entry, and pythia-core is asked for within
-  one release series (`pythia-core>=0.1.1,<0.2`). A test holds all three.
+  one release series (`pythia-core>=0.1.2,<0.2`). A test holds all three.
 
 ## Releasing
 

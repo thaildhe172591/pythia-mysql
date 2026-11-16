@@ -9,7 +9,7 @@ its siblings do on PostgreSQL, SQL Server and MongoDB: the agent learns
 from the live catalog, asks a person before any write, and writes only
 through a gate that snapshots, verifies and reports honestly.
 
-**Alpha (0.2.0).** It reads everything pythia's Learn movement needs,
+**Alpha (0.3.0).** It reads everything pythia's Learn movement needs,
 writes through one gate — data rehearsed in a transaction, DDL predicted,
 written once and read back — and wires a project for an agent: the guard,
 the session brief, the approval doors and the `pythia-mysql-*` skills.
