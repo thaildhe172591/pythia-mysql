@@ -48,6 +48,20 @@ SCRIPT = "|".join((
     r"reload|refresh|shutdown|start-replica|stop-replica|debug)\b",
 ))
 
+# MySQL's drivers as code opens them: a command naming one with write SQL
+# (an inline `python -c`, `node -e`, a heredoc) is denied by pythia-core's
+# guard. A script file it cannot read gets through: a least-privilege
+# account for the agent is the real line (README, "What the hook stops").
+DRIVERS = "|".join((
+    r"\bpymysql\s*\.\s*(connect|Connect|connections)\b",
+    r"\bmysql\s*\.\s*connector\b|\bimport\s+mysql\.connector\b|\bfrom\s+mysql\s+import\s+connector\b",
+    r"\bMySQLdb\b|\b_mysql\b",
+    r"\bmariadb\s*\.\s*connect\b",
+    r"\baiomysql\b|\basyncmy\b",
+    r"['\"]mysql2?(/promise)?['\"]|\bcreateConnection\s*\(|\bcreatePool\s*\(",
+    r"\bsqlalchemy\b[^\n]*\bmysql|\bmysql\+\w+://",
+))
+
 TEMPLATE = {
     "default": "dev",
     "dev": {
@@ -57,6 +71,8 @@ TEMPLATE = {
         "user": "",
         "password": "",
         "tls": "request",
+        "connect_timeout": 10,
+        "accept_below_floor": False,
     },
 }
 

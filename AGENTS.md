@@ -10,7 +10,8 @@ routes).
 ## Using pythia-mysql as an agent (Phase 11)
 
 1. **Ask the database, never the dump.** `ls`, `src`, `cols`, `ddl`, `grep`
-   against the live schema; `check` says where unqualified names land (the
+   against the live schema, and `query "SELECT ..."` for rows (one read,
+   never the `mysql` client); `check` says where unqualified names land (the
    connection's database).
 2. **Lint before apply.** `pythia-mysql lint <files>` — a change's files in
    one run. Errors are fixed, not argued; the team's `.pythia/mysql/

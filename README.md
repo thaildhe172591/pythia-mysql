@@ -16,7 +16,7 @@ the session brief, the approval doors and the `pythia-mysql-*` skills.
 
 | Works today |
 |---|
-| reads: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
+| reads: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `query`, `connections` |
 | writes: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | the harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
@@ -78,7 +78,9 @@ write policy). Before every tool call the guard decides:
 | The agent runs | The guard |
 |---|---|
 | `mysql`, `mysqlsh` or `mariadb` given write SQL (DDL, DML, `CALL`, `DO`, `PREPARE`/`EXECUTE`, `LOAD DATA`, `SET GLOBAL`, `SELECT ... INTO OUTFILE`, `LOCK TABLES`, `source file.sql`), a script (`< file`, a pipe into the client, `mysqlsh -f`), MySQL Shell's `util.load*`; `mysqlimport`; `mysqladmin` create, drop, flush, kill, password or shutdown — also behind `docker exec`, `ssh`, `sudo` or `bash -c` | denies: writes go through `pythia-mysql apply` |
+| a Python or Node one-liner opening a MySQL driver (PyMySQL, mysql-connector, MySQLdb, mariadb, aiomysql, mysql2, SQLAlchemy `mysql+`) with write SQL | denies |
 | an MCP SQL tool given write SQL | denies |
+| `mysql` named only in the text of `echo`, `printf`, `git commit`/`log`/…, `gh issue`/`pr`/… (not piped on, no `$(...)`) | stays out: nothing runs it |
 | reading `connections.json`; editing `policy.json`, the journal or a grant; setting `PYTHIA_MYSQL_CI`; calling `grants.mint` from a one-liner | denies |
 | a `pythia-mysql` read, a preview, `approve --card` | allows without a prompt |
 | `apply --confirm <token>` the developer already approved on this connection | allows; apply re-verifies it |
@@ -87,8 +89,11 @@ write policy). Before every tool call the guard decides:
 The guard reads a command for what it names, not what it means: it can
 deny a harmless command (a `SELECT` whose text mentions `drop`) and miss a
 write spelled in a way it does not list. It sees the commands Claude Code
-hands its tools, not Workbench or a driver inside the application. The gate
-behind it holds either way (pythia-core's SECURITY.md).
+hands its tools, not Workbench, a driver script in a file or a driver
+inside the application. The gate behind it holds either way (pythia-core's
+SECURITY.md) — and the real line is the agent's account: give it reads
+only (see Least privilege), and keep the write account for `apply`. A
+refusal says whether it saw write SQL or a script or stdin it cannot read.
 
 pythia-postgres, pythia-mssql and pythia-mongo install beside it in one
 project, and pythia for Oracle too: each keeps the others' hooks and
@@ -122,6 +127,16 @@ only (pythia-core's CI checks it with all five installed).
 - The entry is picked by `--conn NAME`, then `PYTHIA_MYSQL_CONNECTION`, then
   the only entry, the folder directly under the project root, then
   `"default"`. `PYTHIA_MYSQL_CONFIG` points at another file.
+- `connect_timeout` (seconds, default 10) bounds the wait for a server.
+  `accept_below_floor: true` is the developer saying they know the server
+  is older than the floor: `check` then prints a `floor` row instead of the
+  warning. The warning is only ever printed by `check`, never by a read.
+- `pythia-mysql connections add NAME --set host=db-dev --set
+  database=app_owner --set user=app_agent [--default]` writes an entry (the
+  password prompted for, or read with `--password-stdin`, never an
+  argument; the file rewritten whole, mode 600), and `connections remove
+  NAME` drops one — both at the developer's console. `connections test
+  [NAME]` connects read-only and says what answered.
 
 pythia for Oracle keeps `.pythia/connections.json`, and the other engines
 `.pythia/postgres/`, `.pythia/mssql/` and `.pythia/mongo/`; pythia-mysql
@@ -139,11 +154,26 @@ pythia-mysql grep "t_order where"  # every line of code holding a text
 pythia-mysql deps p_order_paid     # what it uses
 pythia-mysql impact t_order        # what uses it: run before changing it
 pythia-mysql errors [NAME]         # views MySQL has marked broken; what it cannot check
+pythia-mysql query "SELECT status, count(*) FROM t_order GROUP BY status"
+pythia-mysql query -f report.sql --redact email   # one read; personal data as ***
 ```
 
 `--json` gives one envelope per command; `--limit`, `--max-lines` and
 `--offset` window long output, and any truncation says how to fetch the
 rest.
+
+`check` also says who the session is: the user and its grants, whether
+the session is read-only, TLS (with a warning when the connection is not
+encrypted) and connection headroom (`Threads_connected` against
+`max_connections`, with a warning near the limit).
+
+`query` runs one statement that only reads — `SELECT`, `WITH`, `SHOW`,
+`DESCRIBE`, `EXPLAIN`, `TABLE`, `VALUES` — in the read-only session every
+read runs in. It is refused before a connection opens when the text holds
+more than one statement, a `/*! */` comment, `FOR UPDATE`/`FOR SHARE`,
+`INTO`, `LOAD_FILE` or any write. The guard lets it through without a
+prompt: it is the way to read rows, where the agent would otherwise reach
+for the `mysql` client.
 
 ### What the catalog cannot see, and how pythia-mysql says so
 
@@ -450,6 +480,12 @@ holding every privilege on the server, `SUPER`, `SYSTEM_USER`,
 `SET_ANY_DEFINER`, `SET_USER_ID` or MariaDB's `SET USER` is named in the
 preview: far more than a change needs. The live check runs every write path as an account whose
 write privileges stop at its schema.
+
+The preview reads `SHOW GRANTS` and refuses a write the account plainly
+cannot make (`app_agent lacks CREATE on app_owner.t_order — MySQL would
+refuse this write after the approval`), so nobody approves a write that
+cannot land. It refuses only what the grants prove: an account with a role,
+or whose grants cannot be read, is let through to MySQL's own check.
 
 ## Tests
 

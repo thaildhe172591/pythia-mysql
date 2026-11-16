@@ -1216,7 +1216,9 @@ def test_a_routine_is_predicted_not_verified_and_its_replacement_named():
     assert "no CREATE OR REPLACE PROCEDURE" in notes and "scratch name" in notes
     assert "definer changes from root@% to app_agent@%" in notes, notes
     assert "cannot put the old one back" in notes and "SET_ANY_DEFINER" in notes, notes
-    may = predicting({"grants.sql": (("g",), [("GRANT SET_ANY_DEFINER ON *.* TO `a`@`%`",)])})
+    may = predicting({"grants.sql": (("g",), [
+        ("GRANT SET_ANY_DEFINER ON *.* TO `a`@`%`",),
+        ("GRANT CREATE ROUTINE, ALTER ROUTINE ON `app_owner`.* TO `a`@`%`",)])})
     out = write.rehearse(may, "app_owner", "source", stmt, ident, snap, DriverError)
     assert "cannot put the old one back" not in " ".join(out["notes"])
     trig = "create trigger trg before insert on t_gone for each row set new.a = 1"
@@ -2138,6 +2140,179 @@ def test_what_only_mariadb_writes_is_classified():
     assert "starts again" in write.destructive_reason("create or replace sequence s_order",
                                                       "structural")
     assert write.classify("create table package (id int)") == ("structural", None)
+
+
+# --- query: rows, read-only (#1) ---------------------------------------------------------
+
+def test_query_takes_one_statement_that_only_reads():
+    e = MySqlEngine()
+    for ok in ("select id, status from t_order where id = 1",
+               "  SELECT * FROM t_order; ", "show grants", "SHOW STATUS LIKE 'Threads%'",
+               "describe t_order", "desc t_order", "explain select * from t_order",
+               "with x as (select 1 a) select a from x",
+               "select 'delete from t' as note", "select 1 -- update t set a = 1"):
+        assert e.query_refusal(ok) is None, ok
+    for bad, said in (("delete from t_order", "only reads"),
+                      ("update t_order set a = 1", "only reads"),
+                      ("call p_settle()", "only reads"),
+                      ("select 1; select 2", "one statement"),
+                      ("select 1; drop table t_order", "one statement"),
+                      ("select * from t_order into outfile '/tmp/x'", "INTO"),
+                      ("select id into @x from t_order", "INTO"),
+                      ("select * from t_order for update", "lock"),
+                      ("select * from t_order lock in share mode", "lock"),
+                      ("with x as (select 1) delete from t_order", "only reads"),
+                      ("select load_file('/etc/passwd')", "LOAD_FILE"),
+                      ("", "empty")):
+        why = e.query_refusal(bad)
+        assert why and said.lower() in why.lower(), (bad, why)
+
+
+def test_query_runs_the_text_in_a_read_only_session_and_rolls_back():
+    seen = []
+
+    def on_text(sql):
+        seen.append(sql)
+        return ("id", "status"), [(i, "PAID") for i in range(10)], 10
+    with fake_pymysql() as rec, project(DEV):
+        mod = sys.modules["pymysql"]
+        plain = mod.connect
+
+        def connect(**kw):
+            conn = plain(**kw)
+            conn.__class__ = ScriptConn
+            conn.texts, conn.on_text = [], on_text
+            return conn
+        mod.connect = connect
+        code, out, err = run("query", "select id, status from t_order", "--limit", "3")
+    assert code == 0, err
+    assert out.splitlines()[0] == "id\tstatus" and "-- truncated at 3 rows" in out
+    assert seen == ["select id, status from t_order"]
+    conn = rec["conns"][0]
+    assert conn.names()[0] == "session-read-only.sql"
+    assert conn.closed is True and conn.commits == 0
+    with fake_pymysql(), project(DEV):
+        expect_exit(lambda: run("query", "delete from t_order"), "only reads",
+                    "pythia-mysql apply")
+
+
+def test_the_guard_waves_a_query_through():
+    with project(DEV) as root:
+        assert guard(root, 'pythia-mysql query "select * from t_order"') == "allow"
+
+
+# --- check: who, encrypted, headroom (#7) ------------------------------------------------
+
+STATUS = {
+    "current-user.sql": (("account",), [("app_agent@%",)]),
+    "grants.sql": (("g",), [("GRANT USAGE ON *.* TO `app_agent`@`%`",),
+                            ("GRANT SELECT, SHOW VIEW ON `app_owner`.* TO `app_agent`@`%`",)]),
+    "session-variables.sql": (("Variable_name", "Value"), [
+        ("max_connections", "151"), ("require_secure_transport", "OFF"),
+        ("tls_version", "TLSv1.2,TLSv1.3"), ("transaction_read_only", "ON")]),
+    "session-status.sql": (("Variable_name", "Value"), [("Ssl_cipher", "")]),
+    "server-status.sql": (("Variable_name", "Value"), [
+        ("Threads_connected", "149"), ("Max_used_connections", "151"),
+        ("Max_used_connections_time", "2026-11-15 09:12:00"),
+        ("Connection_errors_max_connections", "27013")]),
+}
+
+
+def test_check_says_who_whether_encrypted_and_the_connection_headroom():
+    with fake_pymysql(dict(BASIC, **STATUS)), project(DEV):
+        code, out, _ = run("check", "--json")
+    doc = json.loads(out)
+    rows = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}
+    assert code == 0 and rows["user"] == "app_agent@%"
+    assert "SELECT, SHOW VIEW on app_owner.*" in rows["grants"]
+    assert rows["read_only"].startswith("yes")
+    assert rows["tls"].startswith("none") and "require_secure_transport OFF" in rows["tls"]
+    assert rows["connections"].startswith("149 / 151")
+    assert "max used 151 at 2026-11-15 09:12:00" in rows["connections"]
+    warn = " ".join(doc["warnings"])
+    assert "not encrypted" in warn and "27013" in warn and "max_connections" in warn
+    calm = dict(STATUS)
+    calm["session-status.sql"] = (("Variable_name", "Value"),
+                                  [("Ssl_cipher", "TLS_AES_256_GCM_SHA384")])
+    calm["server-status.sql"] = (("Variable_name", "Value"), [
+        ("Threads_connected", "3"), ("Max_used_connections", "9"),
+        ("Connection_errors_max_connections", "0")])
+    with fake_pymysql(dict(BASIC, **calm)), project(DEV):
+        code, out, _ = run("check", "--json")
+    doc = json.loads(out)
+    rows = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}
+    assert rows["tls"].startswith("TLS_AES_256_GCM_SHA384") and doc["warnings"] == []
+
+
+# --- the preview knows the account cannot write it (#4) ----------------------------------
+
+def test_a_write_the_account_may_not_make_is_refused_in_the_preview():
+    def grants(*lines):
+        return {"grants.sql": (("g",), [(ln,) for ln in lines]),
+                "table-comment.sql": (("c",), [("old",)])}
+    stmt = "alter table app_owner.t_order comment = 'Orders'"
+    ident = write.parse_object(stmt, "comments")
+    reads_only = grants("GRANT USAGE ON *.* TO `app_agent`@`%`",
+                        "GRANT SELECT, SHOW VIEW ON `app_owner`.* TO `app_agent`@`%`")
+    out = write.rehearse(predicting(reads_only), "app_owner", "comments", stmt, ident, {},
+                         DriverError)
+    assert out["error"] and "lacks ALTER on app_owner.t_order" in out["error"], out
+    assert "app_agent@%" in out["error"] and "another connection" in out["error"]
+    for lines in (("GRANT ALTER ON `app_owner`.* TO `app_agent`@`%`",),
+                  ("GRANT ALL PRIVILEGES ON *.* TO `app_agent`@`%`",),
+                  ("GRANT ALTER ON `app_owner`.`t_order` TO `app_agent`@`%`",),
+                  ("GRANT SELECT, ALTER ON `app\\_%`.* TO `app_agent`@`%`",),
+                  # a role may carry it: not known, so not refused
+                  ("GRANT SELECT ON `app_owner`.* TO `app_agent`@`%`",
+                   "GRANT `app_writer`@`%` TO `app_agent`@`%`"),
+                  ()):                       # SHOW GRANTS said nothing: not known
+        out = write.rehearse(predicting(grants(*lines)), "app_owner", "comments", stmt,
+                             ident, {}, DriverError)
+        assert not (out.get("error") or "").startswith("app_agent"), (lines, out)
+        assert "lacks" not in (out.get("error") or ""), (lines, out)
+    need = write.required_privilege
+    assert need("structural", "create table app_owner.t_x (id int)", None, "app_owner") == \
+        ("CREATE", "app_owner", None)
+    assert need("structural", "drop table t_order", None, "app_owner") == \
+        ("DROP", "app_owner", "t_order")
+    assert need("structural", "create index ix_a on t_order (a)", None, "app_owner") == \
+        ("INDEX", "app_owner", "t_order")
+    src = write.parse_object(NEW_P, "source")
+    assert need("source", NEW_P, src, "app_owner") == ("CREATE ROUTINE", "app_owner", None)
+
+
+# --- driver writes in an inline script (#3) ------------------------------------------------
+
+def test_the_guard_denies_a_driver_write_in_an_inline_script():
+    with project(DEV) as root:
+        for cmd in ('python -c "import pymysql; c = pymysql.connect(host=\'127.0.0.1\'); '
+                    "c.cursor().execute('DELETE FROM t'); c.commit()\"",
+                    'python3 -c "import mysql.connector as m; '
+                    "m.connect(user='x').cursor().execute('drop table t')\"",
+                    "node -e \"require('mysql2').createConnection({}).query('UPDATE t SET a=1')\"",
+                    'python -c "import MySQLdb; MySQLdb.connect().cursor()'
+                    ".execute('insert into t values (1)')\""):
+            assert guard(root, cmd) == "deny", cmd
+        assert guard(root, 'python -c "import pymysql; '
+                           "pymysql.connect().cursor().execute('select 1')\"") is None
+
+
+# --- below the floor, acknowledged (#9) ----------------------------------------------------
+
+def test_only_check_says_below_floor_and_a_connection_may_accept_it():
+    old = dict(BASIC)
+    old["server-version.sql"] = (("version", "edition", "database_name"),
+                                 [("8.0.46", "MySQL Community Server - GPL", "app_owner")])
+    with fake_pymysql(old), project(DEV):
+        _, out, err = run("ls", "t_%")
+    assert "floor" not in out + err                  # a read command never says it
+    with fake_pymysql(old), project({"dev": dict(DEV["dev"], accept_below_floor=True)}):
+        code, out, _ = run("check", "--json")
+    doc = json.loads(out)
+    assert code == 0 and doc["below_floor"] is None
+    rows = {r["ITEM"]: r["VALUE"] for r in doc["rows"]}
+    assert rows["floor"].startswith("MySQL 8.0 is below 8.4 — accepted for this connection")
+    assert "accept_below_floor" in MySqlEngine().connections_template()["dev"]
 
 
 def main():

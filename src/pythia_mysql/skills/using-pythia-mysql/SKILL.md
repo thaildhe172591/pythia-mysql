@@ -23,6 +23,7 @@ questions. Opened the wrong one? Close it, no harm done.
 | The request sounds like | Open first | Then |
 |---|---|---|
 | "explain X / why / how does it work" ("giải thích") | `pythia-mysql-explore` | |
+| "how many rows / show me the data / run this SELECT" | `pythia-mysql-explore` (`query`) | |
 | "is it safe to touch X" | `pythia-mysql-impact` | |
 | "change / fix / add X" ("sửa", "thêm") | `pythia-mysql-impact` | write, then `pythia-mysql-apply` |
 | "land / apply this" — one statement | `pythia-mysql-apply` | `pythia-mysql-verify` |
@@ -31,7 +32,7 @@ questions. Opened the wrong one? Close it, no harm done.
 | "undo / restore X" | `pythia-mysql-apply` (a restore is a write) | `pythia-mysql-verify` |
 | an error from MySQL, a broken view or procedure | `pythia-mysql-explore` (`errors`, `src`) | |
 | about to say done / fixed / works | `pythia-mysql-verify` — evidence first | |
-| setup, connection failures, the hooks not running | `pythia-mysql doctor`, then `pythia-mysql check` | |
+| setup, connection failures, the hooks not running | `pythia-mysql doctor`, then `pythia-mysql connections test` and `check` | a new entry is `connections add` — the developer's, at a console |
 
 Priority when several apply: **process before construction** — impact
 before writing, apply's preview before any write, verify before "done".

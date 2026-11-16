@@ -18,7 +18,7 @@ import re
 import ssl
 import sys
 
-from . import __version__, guard, read, write
+from . import __version__, guard, read, status, write
 from .catalog import (MARIADB, QUERY_BINDS, QUERY_DIR, fold, ident, q,  # noqa: F401 — QUERY_*
                       server)                                       # re-exported
 
@@ -113,6 +113,9 @@ class MySqlEngine:
                      "cryptography.")
         # what core prints names the server this command reached
         self.label = server(conn)
+        # a connection may accept running below the floor (check then names
+        # it as accepted, not as a warning)
+        self._accept_below_floor = entry.get("accept_below_floor") is True
         return conn
 
     def session(self, conn, readonly):
@@ -183,7 +186,15 @@ class MySqlEngine:
 
     def floor_warning(self, conn):
         """Below MySQL 8.4 LTS or MariaDB 10.11 LTS, the oldest versions CI
-        tests: said by `check`, never refused (pythia-core DESIGN.md §8)."""
+        tests: said by `check` — no other command — and never refused
+        (pythia-core DESIGN.md §8). A connection with "accept_below_floor":
+        true has heard it: check then lists it as a status line instead."""
+        said = self._below_floor(conn)
+        if said and getattr(self, "_accept_below_floor", False):
+            return None
+        return said
+
+    def _below_floor(self, conn):
         version = q(conn, "server-version.sql")[1][0][0]
         m = re.match(r"(?:5\.5\.5-)?(\d+)\.(\d+)", str(version))
         if not m:
@@ -200,6 +211,24 @@ class MySqlEngine:
         return (f"MySQL {found[0]}.{found[1]} is below pythia-mysql's floor, "
                 "8.4: it is not tested there (CI runs 8.4 to 9.5), and Oracle no "
                 "longer supports it. Most commands may still work.")
+
+    def status(self, conn):
+        accepted = None
+        if getattr(self, "_accept_below_floor", False) and self._below_floor(conn):
+            m = re.match(r"(\S+ \d+\.\d+) is below .*?floor, ([\d.]+)",
+                         self._below_floor(conn))
+            accepted = (f"{m.group(1)} is below {m.group(2)} — accepted for this "
+                        "connection (accept_below_floor); it is not tested there"
+                        if m else "below the floor — accepted for this connection")
+        return status.status(conn, accepted)
+
+    # --- the query tier (status.py): rows, read-only --------------------------
+
+    def query_refusal(self, sql):
+        return status.query_refusal(sql)
+
+    def run_query(self, conn, schema, sql, fetch):
+        return status.run_query(conn, schema, sql, fetch)
 
     def current_schema(self, conn):
         rows = q(conn, "current-schema.sql")[1]
@@ -289,6 +318,9 @@ class MySqlEngine:
 
     def raw_client_pattern(self):
         return guard.CLIENTS
+
+    def driver_pattern(self):
+        return guard.DRIVERS
 
     def write_sql_pattern(self):
         return guard.WRITE_SQL
