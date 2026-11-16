@@ -1,10 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-16
 
-Needs the pythia-core release with the query tier, `connections add |
-remove | test`, `status` and `driver_pattern` (pythia-core#5); the
-`pythia-core` floor rises with it.
+Asks for pythia-core 0.1.2 (`pythia-core>=0.1.2,<0.2`): the query tier,
+`connections add | remove | test`, `status` and `driver_pattern` are there.
 
 - **`query "SELECT ..."`** (#1): one statement that only reads, refused
   before connecting when it holds more than one statement, a `/*! */`

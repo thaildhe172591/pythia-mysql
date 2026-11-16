@@ -9,7 +9,7 @@ Oracle và các engine anh em làm trên PostgreSQL, SQL Server và MongoDB:
 agent học từ catalog đang chạy, hỏi một người trước mọi lần ghi, và chỉ ghi
 qua một cổng có snapshot, có kiểm chứng và báo cáo trung thực.
 
-**Alpha (0.2.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
+**Alpha (0.3.0).** Nó đọc được mọi thứ mà nhịp Học của pythia cần, ghi qua
 một cổng duy nhất — dữ liệu được diễn tập trong transaction, DDL được dự
 đoán, ghi một lần rồi đọc lại — và chuẩn bị một project cho agent: guard,
 bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-mysql-*`.
