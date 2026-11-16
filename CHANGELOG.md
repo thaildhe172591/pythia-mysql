@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Needs the pythia-core release with the query tier, `connections add |
+remove | test`, `status` and `driver_pattern` (pythia-core#5); the
+`pythia-core` floor rises with it.
+
+- **`query "SELECT ..."`** (#1): one statement that only reads, refused
+  before connecting when it holds more than one statement, a `/*! */`
+  comment, `FOR UPDATE`/`FOR SHARE`, `INTO`, `LOAD_FILE` or a write; run in
+  the read-only session, rows windowed, `--redact COL`. The guard lets it
+  through.
+- **A client named in text is not run** (#2, in pythia-core): `mysql` in a
+  commit message, an issue title or an `echo` is no longer denied; any
+  other program naming it still is, and the refusal says write SQL or
+  script.
+- **`check` says who the session is** (#3): user, grants, read-only, TLS
+  (a warning when unencrypted) and connection headroom (a warning near
+  `max_connections`).
+- **A write the account cannot make is refused in the preview** (#4): the
+  grants `SHOW GRANTS` proves missing are named before anyone approves; a
+  role or unreadable grants are left to MySQL.
+- **`connections add | remove | test`** (#6) and two new connection keys,
+  `connect_timeout` (default 10) and `accept_below_floor` (#9): the floor
+  warning is only ever printed by `check`, and not at all once the
+  developer accepts it.
+- **The guard denies a MySQL driver opened inline with write SQL** (#7):
+  PyMySQL, mysql-connector, MySQLdb, mariadb, aiomysql, mysql2, SQLAlchemy.
+  README says what it cannot see — a driver script in a file — and that a
+  read-only agent account is the real line.
+
 ## 0.2.0 — 2026-10-21
 
 MariaDB, read and written: pythia-mysql works on MariaDB 10.11 and later

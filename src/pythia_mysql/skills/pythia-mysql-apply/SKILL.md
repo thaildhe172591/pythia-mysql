@@ -42,6 +42,9 @@ NO WRITE WITHOUT A PREVIEW THE DEVELOPER SAW AND APPROVED
    - **predicted — nothing ran** (DDL): what it **would break** (the views
      MySQL would mark invalid; on MariaDB, the views that would no longer
      open), or `NOT VERIFIED` with the reason;
+   - a refusal before any preview when `SHOW GRANTS` proves the account
+     lacks the privilege (`... lacks CREATE on app_owner.t_order`): relay
+     it; granting is the developer's, outside pythia;
    - notes: a CREATE that replaces an existing routine (MySQL has no CREATE
      OR REPLACE for one; MariaDB replaces it in one step), a definer that
      changes, `! DESTRUCTIVE`;

@@ -764,7 +764,121 @@ def _candidates(conn, touched, own=(), gone=()):
     return sorted([s, n] for s, n in found - set(gone))
 
 
+_STRUCT_NEED = (
+    (re.compile(r"\s*alter\s+table\s+" + _NAME, re.I), "ALTER", True),
+    (re.compile(r"\s*create\s+(?:temporary\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+                + _NAME, re.I), "CREATE", False),
+    (re.compile(r"\s*drop\s+(?:temporary\s+)?table\s+(?:if\s+exists\s+)?" + _NAME,
+                re.I), "DROP", True),
+    (re.compile(r"\s*truncate\s+(?:table\s+)?" + _NAME, re.I), "DROP", True),
+    (re.compile(r"\s*create\s+(?:unique\s+|fulltext\s+|spatial\s+)?index\s+" + _ID
+                + r"\s+on\s+" + _NAME, re.I), "INDEX", True),
+    (re.compile(r"\s*drop\s+index\s+" + _ID + r"\s+on\s+" + _NAME, re.I), "INDEX", True),
+    (re.compile(r"\s*drop\s+view\s+(?:if\s+exists\s+)?" + _NAME, re.I), "DROP", True),
+)
+
+
+def required_privilege(group, stmt, ident_, schema):
+    """(privilege, schema, table or None) MySQL will ask of the account for
+    this write, or None when it is not one of the plain cases read here."""
+    text = lex(stmt).uncommented
+    if group == "comments" and ident_:
+        return "ALTER", fold(_unq(ident_.get("schema") or schema)), ident_["table"]
+    if group == "source" and ident_:
+        s = fold(_unq(ident_.get("schema") or schema))
+        kind = ident_["type"]
+        if kind in ("PROCEDURE", "FUNCTION"):
+            return ("ALTER ROUTINE" if ident_.get("verb") == "alter" else "CREATE ROUTINE",
+                    s, None)
+        if kind == "TRIGGER":
+            return "TRIGGER", s, ident_.get("table")
+        if kind == "EVENT":
+            return "EVENT", s, None
+        if kind == "VIEW":
+            return "CREATE VIEW", s, None
+        return None
+    if group == "structural":
+        for pattern, priv, on_table in _STRUCT_NEED:
+            m = pattern.match(text)
+            if m:
+                s, name = _qualified(m)
+                return priv, fold(_unq(s or schema)), name if on_table else None
+    return None
+
+
+def _unq(name):
+    return str(name or "").strip("`\"")
+
+
+def _scope_covers(scope, schema, table):
+    """Does a GRANT's ON clause (`db`.`t`, `db`.*, *.*, a LIKE pattern on db)
+    reach this schema and table?"""
+    m = re.match(r"(`(?:[^`]|``)*`|[^.\s]+)\.(`(?:[^`]|``)*`|\S+)$", scope.strip())
+    if not m:
+        return False
+    db, tb = _unq(m.group(1)).replace("``", "`"), _unq(m.group(2))
+    if db != "*":
+        # a LIKE pattern: % and _ are wildcards, \_ and \% literal
+        if not re.fullmatch(_like(db), schema, re.I):
+            return False
+    if tb != "*" and (table is None or tb.lower() != str(table).lower()):
+        return False
+    return True
+
+
+def _like(pattern):
+    out, i = "", 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            out += re.escape(pattern[i + 1])
+            i += 2
+            continue
+        out += ".*" if c == "%" else "." if c == "_" else re.escape(c)
+        i += 1
+    return out
+
+
+def missing_privilege(conn, schema, group, stmt, ident_):
+    """Why MySQL will refuse this write for want of a privilege, or None —
+    asked in the preview, so the developer never approves a write that cannot
+    land. Refuses only what SHOW GRANTS proves: a role it lists (whose
+    privileges may not show), or no GRANT read at all, is not proof."""
+    need = required_privilege(group, stmt, ident_, schema)
+    if not need:
+        return None
+    priv, s, table = need
+    try:
+        lines = [str(r[0]) for r in q(conn, "grants.sql")[1]]
+    except Exception:  # noqa: BLE001 — unknown is not a refusal
+        return None
+    held, read_any = [], False
+    for line in lines:
+        m = re.match(r"GRANT\s+(.*?)\s+ON\s+(?:(?:TABLE|PROCEDURE|FUNCTION)\s+)?(\S+)"
+                     r"\s+TO\s", line, re.I | re.S)
+        if not m:
+            if re.match(r"GRANT\s+\S.*\s+TO\s", line, re.I | re.S):
+                return None               # a role: its privileges may not show here
+            continue
+        read_any = True
+        privs = {" ".join(p.split()).upper() for p in m.group(1).split(",")}
+        privs = {re.sub(r"\s*\(.*\)$", "", p) for p in privs}   # column lists
+        if _scope_covers(m.group(2), s, table):
+            held.append(privs)
+    if not read_any:
+        return None
+    if any(p & {priv, "ALL", "ALL PRIVILEGES"} for p in held):
+        return None
+    who = q(conn, "current-user.sql")[1][0][0]
+    where = f"{s}.{table}" if table else f"{s}.*"
+    return (f"{who} lacks {priv} on {where} — MySQL would refuse this write after "
+            "the approval. Grant it (outside pythia), or use another connection.")
+
+
 def _predict(conn, schema, group, stmt, ident_, snap, errors):
+    lack = missing_privilege(conn, schema, group, stmt, ident_)
+    if lack:
+        return {"error": lack}
     mariadb = server(conn) == MARIADB
     if group == "structural" and not mariadb and _SEQUENCE.match(lex(stmt).uncommented):
         return {"error": "MySQL has no sequences: CREATE, ALTER and DROP SEQUENCE are "

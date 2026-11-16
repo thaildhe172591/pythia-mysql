@@ -66,6 +66,9 @@ QUERY_BINDS = {
     "current-user.sql": set(),
     "row-set-count.sql": set(),
     "row-set-sample.sql": set(),
+    "session-variables.sql": set(),
+    "session-status.sql": set(),
+    "server-status.sql": set(),
 }
 
 MARIADB_QUERY_BINDS = {

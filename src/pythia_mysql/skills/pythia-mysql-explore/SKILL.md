@@ -33,6 +33,8 @@ EVERY FACT COMES FROM THE LIVE CATALOG, WITH THE COMMAND THAT SHOWED IT
 | What does it use? | `pythia-mysql deps <name>` |
 | What uses it? | `pythia-mysql impact <name>` (see `pythia-mysql-impact`) |
 | What is broken now? | `pythia-mysql errors [<name>]` |
+| What do the rows say? (counts, a sample, a report) | `pythia-mysql query "SELECT ..."` (or `-f file.sql`; `--redact <col>` for personal data) |
+| Who am I connected as — grants, TLS, headroom? | `pythia-mysql check` |
 
 `--json` gives structured output on every command. MySQL keeps no line
 numbers and no CREATE statement: `src` rebuilds the header on line 1 and
@@ -66,7 +68,7 @@ rewrote it.
 | "The migration file shows the table" | The database may not. `pythia-mysql cols`. |
 | "`errors` printed nothing, so it is clean" | Only if no NOT VERIFIED line was printed. |
 | "I'll open connections.json to see the host" | Never: `pythia-mysql connections` lists it without passwords. |
-| "I'll check it in the mysql client quickly" | Read commands answer it, with truncation and blind spots said. |
+| "I'll check it in the mysql client quickly" | Read commands answer it, with truncation and blind spots said; rows come from `pythia-mysql query`. |
 
 ## Hand-off
 

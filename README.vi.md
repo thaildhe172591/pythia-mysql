@@ -16,7 +16,7 @@ bản tóm tắt đầu phiên, các cánh cửa duyệt và các skill `pythia-
 
 | Đã dùng được |
 |---|
-| đọc: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `connections` |
+| đọc: `check`, `ls`, `src`, `cols`, `ddl`, `grep`, `deps`, `impact`, `errors`, `query`, `connections` |
 | ghi: `apply`, `deploy`, `approve`, `journal`, `history`, `policy`, `autopilot`, `lint` |
 | harness: `install`, `doctor`, `hook`, `mcp`, `skill lint` |
 
@@ -79,7 +79,9 @@ mỗi lần gọi tool, guard quyết định:
 | Agent chạy | Guard |
 |---|---|
 | `mysql`, `mysqlsh` hay `mariadb` được đưa SQL ghi (DDL, DML, `CALL`, `DO`, `PREPARE`/`EXECUTE`, `LOAD DATA`, `SET GLOBAL`, `SELECT ... INTO OUTFILE`, `LOCK TABLES`, `source file.sql`), một script (`< file`, một pipe vào client, `mysqlsh -f`), `util.load*` của MySQL Shell; `mysqlimport`; `mysqladmin` create, drop, flush, kill, password hay shutdown — kể cả sau `docker exec`, `ssh`, `sudo` hay `bash -c` | chặn: mọi lần ghi đi qua `pythia-mysql apply` |
+| một one-liner Python hay Node mở driver MySQL (PyMySQL, mysql-connector, MySQLdb, mariadb, aiomysql, mysql2, SQLAlchemy `mysql+`) kèm SQL ghi | chặn |
 | một MCP SQL tool được đưa SQL ghi | chặn |
+| `mysql` chỉ được nhắc trong phần chữ của `echo`, `printf`, `git commit`/`log`/…, `gh issue`/`pr`/… (không pipe tiếp, không có `$(...)`) | đứng ngoài: không gì chạy nó |
 | đọc `connections.json`; sửa `policy.json`, journal hay một grant; đặt `PYTHIA_MYSQL_CI`; gọi `grants.mint` từ một one-liner | chặn |
 | một lệnh đọc của `pythia-mysql`, một preview, `approve --card` | cho qua, không hỏi |
 | `apply --confirm <token>` mà dev đã duyệt trên connection này | cho qua; apply kiểm lại |
@@ -88,9 +90,12 @@ mỗi lần gọi tool, guard quyết định:
 Guard đọc một lệnh theo những gì nó gọi tên, không theo ý nghĩa của nó: nó
 có thể chặn một lệnh vô hại (một `SELECT` có chữ `drop` trong nội dung) và
 bỏ lọt một lần ghi được viết theo cách nó không liệt kê. Nó thấy các lệnh mà
-Claude Code đưa cho các tool, không thấy Workbench hay một driver bên trong
-ứng dụng. Cổng phía sau vẫn giữ được trong cả hai trường hợp (SECURITY.md
-của pythia-core).
+Claude Code đưa cho các tool, không thấy Workbench, một script driver nằm
+trong file hay một driver bên trong ứng dụng. Cổng phía sau vẫn giữ được
+trong cả hai trường hợp (SECURITY.md của pythia-core) — và ranh giới thật
+là tài khoản của agent: chỉ cho nó quyền đọc (xem Quyền tối thiểu), và giữ
+tài khoản ghi cho `apply`. Lời từ chối nói rõ nó thấy SQL ghi hay một
+script/stdin mà nó không đọc được nội dung.
 
 pythia-postgres, pythia-mssql và pythia-mongo cài cạnh nó trong cùng một
 project, và pythia cho Oracle cũng vậy: mỗi bên giữ nguyên hook và khối
@@ -125,6 +130,16 @@ năm cùng được cài).
 - Entry được chọn theo `--conn NAME`, rồi `PYTHIA_MYSQL_CONNECTION`, rồi entry
   duy nhất, rồi thư mục ngay dưới gốc project, rồi `"default"`.
   `PYTHIA_MYSQL_CONFIG` trỏ tới một file khác.
+- `connect_timeout` (giây, mặc định 10) giới hạn thời gian chờ server.
+  `accept_below_floor: true` là dev xác nhận họ biết server cũ hơn phiên
+  bản tối thiểu: khi đó `check` in một dòng `floor` thay cho cảnh báo. Cảnh
+  báo này chỉ do `check` in, không bao giờ do một lệnh đọc.
+- `pythia-mysql connections add NAME --set host=db-dev --set
+  database=app_owner --set user=app_agent [--default]` ghi một entry (mật
+  khẩu được hỏi, hoặc đọc bằng `--password-stdin`, không bao giờ là đối
+  số; file được ghi lại toàn bộ, mode 600), còn `connections remove NAME`
+  xoá một entry — cả hai ở console của dev. `connections test [NAME]` kết
+  nối chỉ đọc và cho biết server nào trả lời.
 
 pythia cho Oracle giữ `.pythia/connections.json`, còn các engine khác giữ
 `.pythia/postgres/`, `.pythia/mssql/` và `.pythia/mongo/`; pythia-mysql
@@ -142,11 +157,25 @@ pythia-mysql grep "t_order where"  # every line of code holding a text
 pythia-mysql deps p_order_paid     # what it uses
 pythia-mysql impact t_order        # what uses it: run before changing it
 pythia-mysql errors [NAME]         # views MySQL has marked broken; what it cannot check
+pythia-mysql query "SELECT status, count(*) FROM t_order GROUP BY status"
+pythia-mysql query -f report.sql --redact email   # one read; personal data as ***
 ```
 
 `--json` cho một envelope cho mỗi lệnh; `--limit`, `--max-lines` và
 `--offset` chia cửa sổ cho đầu ra dài, và mọi chỗ bị cắt đều nói cách lấy
 phần còn lại.
+
+`check` cũng cho biết phiên là ai: user và các quyền của nó, phiên có chỉ
+đọc không, TLS (cảnh báo khi kết nối không mã hoá) và số connection còn
+trống (`Threads_connected` so với `max_connections`, cảnh báo khi gần chạm
+giới hạn).
+
+`query` chạy một câu lệnh chỉ đọc — `SELECT`, `WITH`, `SHOW`, `DESCRIBE`,
+`EXPLAIN`, `TABLE`, `VALUES` — trong phiên chỉ đọc mà mọi lệnh đọc dùng. Nó
+bị từ chối trước khi mở kết nối khi nội dung có nhiều hơn một câu lệnh, một
+comment `/*! */`, `FOR UPDATE`/`FOR SHARE`, `INTO`, `LOAD_FILE` hay bất kỳ
+lệnh ghi nào. Guard cho nó qua mà không hỏi: đây là cách đọc dữ liệu, thay
+cho việc agent tìm tới client `mysql`.
 
 ### Những gì catalog không thấy, và pythia-mysql nói ra thế nào
 
@@ -453,6 +482,12 @@ có mọi quyền trên server, `SUPER`, `SYSTEM_USER`, `SET_ANY_DEFINER`,
 `SET_USER_ID` hay `SET USER` của MariaDB được nêu tên trong preview: nhiều
 hơn hẳn những gì một thay đổi cần. Live check chạy mọi đường ghi bằng một tài khoản mà quyền ghi chỉ
 dừng ở schema của nó.
+
+Preview đọc `SHOW GRANTS` và từ chối một lần ghi mà tài khoản rõ ràng không
+làm được (`app_agent lacks CREATE on app_owner.t_order — MySQL would refuse
+this write after the approval`), để không ai duyệt một lần ghi không thể
+vào. Nó chỉ từ chối điều các quyền chứng minh được: tài khoản có role, hoặc
+không đọc được quyền, thì được để MySQL tự kiểm.
 
 ## Kiểm thử
 

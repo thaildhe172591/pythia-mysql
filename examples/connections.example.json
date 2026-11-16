@@ -7,6 +7,8 @@
     "database": "app_owner",
     "user": "",
     "password": "",
-    "tls": "request"
+    "tls": "request",
+    "connect_timeout": 10,
+    "accept_below_floor": false
   }
 }
